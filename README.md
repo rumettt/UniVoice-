@@ -26,7 +26,9 @@ UniVoice/
 │   │   ├── department.controller.ts # Department CRUD and status
 │   │   ├── staffSettings.controller.ts # Memberships & work settings
 │   │   ├── authority.controller.ts # Authority hierarchy & assignments
-│   │   └── category.controller.ts # Category routing configuration
+│   │   ├── category.controller.ts # Category routing configuration
+│   │   ├── request.controller.ts # Student request submission & tracking
+│   │   └── staffQueue.controller.ts # Staff queue discovery, inspection & claiming
 │   ├── middlewares/
 │   │   ├── authenticate.ts     # Bearer JWT verification & active user loader
 │   │   ├── authorize.ts        # Role-based access control (RBAC) & boundaries
@@ -39,7 +41,8 @@ UniVoice/
 │   │   ├── staff.repository.ts # Effective-dated memberships & work settings
 │   │   ├── authority.repository.ts # Authority hierarchy & collision-free reorder
 │   │   ├── category.repository.ts # Category configuration & routing targets
-│   │   └── request.repository.ts  # Student requests & routing
+│   │   ├── request.repository.ts  # Student requests & routing
+│   │   └── staffQueue.repository.ts # Staff queue discovery, eligibility & claiming
 │   ├── routes/
 │   │   ├── index.ts            # Root router — mounts /api/v1
 │   │   └── v1/
@@ -49,7 +52,8 @@ UniVoice/
 │   │       ├── user.router.ts  # /api/v1/users/* endpoints
 │   │       ├── department.router.ts # /api/v1/departments/* endpoints
 │   │       ├── category.router.ts # /api/v1/categories/* endpoints
-│   │       └── request.router.ts  # /api/v1/requests/* endpoints
+│   │       ├── request.router.ts  # /api/v1/requests/* endpoints
+│   │       └── staffQueue.router.ts # /api/v1/staff/* endpoints
 │   ├── services/
 │   │   ├── admin/
 │   │   │   ├── userManagement.service.ts # Transactional user provisioning
@@ -60,6 +64,8 @@ UniVoice/
 │   │   ├── auth/
 │   │   │   ├── password.service.ts # Argon2id password hashing and verification
 │   │   │   └── token.service.ts    # JWT access tokens & refresh token hashing
+│   │   ├── staff/
+│   │   │   └── staffQueue.service.ts # Staff queue eligibility & claim workflow
 │   │   └── student/
 │   │       └── request.service.ts  # Request submission & student workflow service
 │   ├── types/
@@ -75,7 +81,8 @@ UniVoice/
 │       ├── staff.validators.ts # Staff membership & settings validation
 │       ├── authority.validators.ts # Authority levels & assignments validation
 │       ├── category.validators.ts # Category validation
-│       └── request.validators.ts # Student request validation
+│       ├── request.validators.ts # Student request validation
+│       └── staffQueue.validators.ts # Staff queue query & claim validation
 ├── tests/
 │   ├── schema_validation_test.sql  # SQL schema validation suite (database only)
 │   └── unit/                   # TypeScript unit/integration tests
@@ -91,7 +98,8 @@ UniVoice/
 │       ├── authority.test.ts   # Hierarchy, reordering & cross-dept checks
 │       ├── staffSettings.test.ts # Work settings & capacity tests
 │       ├── category.test.ts    # Category routing & active filters tests
-│       └── request.test.ts     # Request submission, routing & student workflow tests
+│       ├── request.test.ts     # Request submission, routing & student workflow tests
+│       └── staffQueue.test.ts  # Staff queue, eligibility preview & claim concurrency tests
 ├── .env.example                # Required environment variable template
 ├── package.json
 ├── PROGRESS.md                 # Project phase & milestone tracker
@@ -263,6 +271,29 @@ Returns API availability and database connectivity status.
 - `GET /api/v1/requests/:requestId`: Retrieve details of an individual request *(Student only)*.
   - Restricted to requests submitted by the authenticated student.
   - Returns 404 for nonexistent requests or requests belonging to other students to avoid information leakage.
+
+---
+
+### Staff Request Queue & Claiming (`/api/v1/staff`)
+
+- `GET /api/v1/staff/queue`: Discover pending/unassigned requests eligible for the authenticated staff member *(Staff only)*.
+  - Automatically queries across all active department memberships where the staff member holds an active authority tier.
+  - Filters by staff authority level rank (`level_order >= current_authority_level.level_order`) and category whitelist/blacklist permissions.
+  - Respects staff active availability; returns empty queue when availability is disabled.
+  - Priority-ordered (`urgent` → `high` → `medium` → `low`), secondary ordered by `created_at ASC` (FIFO).
+  - Enriches results with SLA preview status (`breached`, `warning`, `on_track`).
+  - Supports SQL filtering by `departmentId`, `priority`, and `categoryId`.
+- `GET /api/v1/staff/queue/:requestId`: Inspect read-only details of an individual eligible request *(Staff only)*.
+  - Evaluates live staff eligibility (membership, authority, category access).
+  - Returns 404 for ineligible, deleted, claimed, or nonexistent requests to prevent ID enumeration.
+- `POST /api/v1/staff/requests/:requestId/claim`: Atomically claim a pending request *(Staff only)*.
+  - Leverages database-authoritative PostgreSQL `claim_request()` procedure.
+  - Employs strict two-phase locking (`requests` row `FOR UPDATE` + `staff_department_work_settings` row `FOR UPDATE`) to serialize concurrent claims per staff member and prevent capacity over-subscription.
+  - Enforces capacity limit overrides (falling back to department max active requests), availability status, authority level, and category permissions.
+  - Transitions status to `in_progress`, creates active `request_assignments` record (`ended_at IS NULL`), and relies on database trigger for audit history.
+- `GET /api/v1/staff/requests/me`: Retrieve requests currently assigned to the authenticated staff member *(Staff only)*.
+  - Returns all active assignments (`request_assignments.ended_at IS NULL`).
+  - Supports SQL filtering by `status`, `departmentId`, and `priority`.
 
 ---
 

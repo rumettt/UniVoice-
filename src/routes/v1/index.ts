@@ -5,6 +5,7 @@ import userRouter from './user.router';
 import departmentRouter from './department.router';
 import categoryRouter from './category.router';
 import requestRouter from './request.router';
+import staffQueueRouter from './staffQueue.router';
 
 const v1Router = Router();
 
@@ -14,5 +15,6 @@ v1Router.use('/users', userRouter);
 v1Router.use('/departments', departmentRouter);
 v1Router.use('/categories', categoryRouter);
 v1Router.use('/requests', requestRouter);
+v1Router.use('/staff', staffQueueRouter);
 
 export default v1Router;

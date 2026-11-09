@@ -12,8 +12,81 @@ This document tracks project implementation milestones, completed phases, key ar
 | **Phase 2** | Authentication & Core Authorization | ✅ Completed | 2026-11-05 |
 | **Phase 3** | User & Department Management | ✅ Completed | 2026-11-06 |
 | **Phase 4** | Request Submission & Student Workflow | ✅ Completed | 2026-11-09 |
-| **Phase 5** | Staff Queues, Escalation & Approvals | ⏳ Upcoming | — |
+| **Phase 5** | Staff Queues, Escalation & Approvals | ✅ Completed | 2026-11-09 |
 | **Phase 6** | Notifications & Real-Time Updates | ⏳ Upcoming | — |
+
+---
+
+## Phase 5: Staff Request Queue & Claiming (Completed)
+
+### 1. Implemented Features
+
+- **Eligible Staff Queue (`GET /api/v1/staff/queue`):**
+  - Strict eligibility filtering: Staff members only see requests they are eligible to claim across all their active department memberships.
+  - Eligibility invariants enforced in SQL:
+    1. Request `status = 'pending'` and `current_assignment_id IS NULL`.
+    2. Request is not soft-deleted (`deleted_at IS NULL`).
+    3. Staff has active membership in the request's department (`valid_to IS NULL OR valid_to > NOW()`).
+    4. Threshold Rule: Staff authority level order >= request authority level order.
+    5. Staff is authorized to handle the request category (`staff_category_authorizations.can_handle = TRUE`).
+    6. Staff is available in that department (`staff_department_work_settings.is_available = TRUE`).
+    7. Staff has remaining capacity in that department (`active_assignments < effective_capacity`).
+  - Multi-department staff support: Aggregates eligible requests across all active department memberships with independent capacity and availability resolution.
+  - Query filters: Optional `departmentId` and `priority` filters.
+  - Priority ordering: Deterministically ordered by `urgent` (1) → `high` (2) → `medium` (3) → `low` (4), oldest submission first (`created_at ASC`), with deterministic tie-breaker on `id ASC`.
+  - Queue payload: Returns lightweight response including preview description (truncated at 150 chars), `waitingDurationSeconds`, department, category, and authority details.
+  - Strict pagination: Enforces boundaries with a maximum limit of 100 requests per page.
+- **Eligible Request Inspection (`GET /api/v1/staff/queue/:requestId`):**
+  - Allows staff to inspect full details of an individual request before claiming.
+  - Revalidates all 8 eligibility rules. Returns `404 Not Found` if ineligible or not claimable to prevent cross-department information leakage and ID enumeration.
+  - Opening details is strictly read-only: does not claim, reserve, mutate state, or create history records.
+- **Atomic Request Claiming (`POST /api/v1/staff/requests/:requestId/claim`):**
+  - Authoritative procedural execution: calls the database procedural function `claim_request(p_request_id, p_staff_user_id)`.
+  - Concurrency & Capacity Protection:
+    1. Row lock on `requests` (`FOR UPDATE`) resolves competing staff claims on the same request.
+    2. Row lock on `staff_department_work_settings` (`FOR UPDATE`) serializes claims by the same staff member in that department, guaranteeing simultaneous claims of different requests cannot exceed capacity.
+  - State transitions: Sets `status = 'assigned'`, updates `current_assignment_id`, and creates an active handling interval in `request_assignments` (`source = 'claim'`, `ended_at = NULL`).
+  - Lifecycle audit history: Trigger `trg_requests_lifecycle_history` records `status_changed`, while `claim_request` records the `claimed` event. Zero duplicate history entries inserted by application.
+  - Precise error mappings: Maps PostgreSQL error codes to typed `AppError` responses (`404` for nonexistent/inaccessible, `409` for already-claimed and capacity conflicts, and `403` for unavailable/unauthorized).
+- **My Active Assignments (`GET /api/v1/staff/requests/me`):**
+  - Returns only requests actively assigned to the authenticated staff member (`ended_at IS NULL` and `requests.current_assignment_id = request_assignments.id`).
+  - Excludes ended historical assignments.
+  - Supports optional department and status (`assigned` vs `in_progress`) filters with pagination.
+
+### 2. Architectural Decisions & Boundaries
+
+1. **Single Authoritative Procedural Implementation:**
+   - Rather than duplicating the complex 12-check eligibility and state transition logic in TypeScript, the backend delegates claiming to PostgreSQL's `claim_request()`, maintaining a single source of truth.
+2. **Deterministic Two-Phase Row Locking:**
+   - Concurrency is protected by a strict lock hierarchy: Request Row Lock (`requests`) → Staff-Dept Row Lock (`staff_department_work_settings`). This completely eliminates hash collision risks of advisory locks, avoids table-level locks, and prevents deadlocks.
+3. **Queue and Claim-Time Invariant Consistency:**
+   - Both the queue CTE and `claim_request` evaluate active assignments (`ended_at IS NULL`) and effective capacity (`COALESCE(override, dept_default, 5)`) identically.
+4. **Information Leakage Prevention:**
+   - Single queue inspection (`GET /api/v1/staff/queue/:requestId`) returns `404 Not Found` when a request belongs to an unauthorized department or authority tier.
+
+### 3. Files Created & Modified
+
+#### Created
+- `src/validators/staffQueue.validators.ts`: Zod schemas for queue discovery, claim parameters, and my-assignments queries.
+- `src/repositories/staffQueue.repository.ts`: Repository executing multi-department eligibility CTEs, row-locked claim transactions, and active assignment queries.
+- `src/services/staff/staffQueue.service.ts`: Business logic orchestrating queue discovery, waiting durations, preview formatting, and error mappings.
+- `src/controllers/staffQueue.controller.ts`: Express controller for staff queue endpoints.
+- `src/routes/v1/staffQueue.router.ts`: Staff router with authentication and `requireRole('staff')`.
+- `tests/unit/staffQueue.test.ts`: 21 comprehensive unit tests covering all eligibility, multi-department, claiming, concurrency, capacity, availability, and assignment scenarios.
+
+#### Modified
+- `src/routes/v1/index.ts`: Mounted `/staff` router.
+- `PROGRESS.md`: Documented Phase 5 milestones, architectural decisions, and verification.
+- `README.md`: Documented Phase 5 endpoints, permissions, and query parameters.
+
+### 4. Tests Performed & Results
+
+- **Vitest Unit Test Suite:**
+  - 14 test files, 107 tests, **100% passing**.
+- **TypeScript Typecheck:**
+  - `tsc --noEmit` passed with 0 errors.
+- **Production Build:**
+  - `tsc` compiled successfully to `dist/`.
 
 ---
 

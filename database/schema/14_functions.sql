@@ -281,6 +281,17 @@ BEGIN
       USING ERRCODE = 'invalid_authorization_specification';
   END IF;
 
+  -- 3a. Verify the responsible department is still active
+  IF NOT EXISTS (
+    SELECT 1 FROM departments
+    WHERE id = v_req.responsible_department_id
+      AND is_active = TRUE
+  ) THEN
+    RAISE EXCEPTION 'Department % is no longer active and cannot accept new claims',
+      v_req.responsible_department_id
+      USING ERRCODE = 'invalid_authorization_specification';
+  END IF;
+
   -- 4. Verify staff category authorization
   IF NOT EXISTS (
     SELECT 1 FROM staff_category_authorizations
