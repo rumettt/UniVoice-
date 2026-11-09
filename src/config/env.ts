@@ -24,6 +24,20 @@ const envSchema = z.object({
     .regex(/^\d+$/, 'DB_POOL_MAX must be a numeric string')
     .default('10')
     .transform(Number),
+  JWT_ACCESS_SECRET: z
+    .string()
+    .min(16, 'JWT_ACCESS_SECRET must be at least 16 characters')
+    .default('univoice_dev_jwt_access_secret_key_32bytes_min!'),
+  JWT_REFRESH_SECRET: z
+    .string()
+    .min(16, 'JWT_REFRESH_SECRET must be at least 16 characters')
+    .default('univoice_dev_jwt_refresh_secret_key_32bytes_min!'),
+  JWT_ACCESS_EXPIRES_IN: z.string().default('15m'),
+  JWT_REFRESH_EXPIRES_IN: z.string().default('7d'),
+  COOKIE_SECURE: z
+    .string()
+    .default('false')
+    .transform((val) => val === 'true'),
 });
 
 const parsed = envSchema.safeParse(process.env);
@@ -34,6 +48,19 @@ if (!parsed.success) {
     .join('\n');
   console.error(`[config] Missing or invalid environment variables:\n${missing}`);
   process.exit(1);
+}
+
+// In production, reject development fallback secrets
+if (parsed.data.NODE_ENV === 'production') {
+  if (
+    parsed.data.JWT_ACCESS_SECRET.startsWith('univoice_dev_') ||
+    parsed.data.JWT_REFRESH_SECRET.startsWith('univoice_dev_')
+  ) {
+    console.error(
+      '[config] In production, JWT_ACCESS_SECRET and JWT_REFRESH_SECRET must be set to custom strong secrets.',
+    );
+    process.exit(1);
+  }
 }
 
 export const env = parsed.data;
