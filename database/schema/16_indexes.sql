@@ -116,6 +116,11 @@ CREATE INDEX IF NOT EXISTS idx_comments_request_visible
   ON comments (request_id, created_at)
   WHERE deleted_at IS NULL;
 
+-- Student-visible paginated retrieval (Phase 7 Milestone 2)
+CREATE INDEX IF NOT EXISTS idx_comments_request_visible_paginate
+  ON comments (request_id, created_at ASC)
+  WHERE deleted_at IS NULL AND visibility = 'student_visible';
+
 CREATE INDEX IF NOT EXISTS idx_comments_internal
   ON comments (request_id)
   WHERE deleted_at IS NULL AND visibility = 'internal';

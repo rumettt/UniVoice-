@@ -7,6 +7,7 @@ import categoryRouter from './category.router';
 import requestRouter from './request.router';
 import staffQueueRouter from './staffQueue.router';
 import systemSettingsRouter from './systemSettings.router';
+import { messagingRouter, staffMessagingRouter, attachmentRouter } from './messaging.router';
 
 const v1Router = Router();
 
@@ -16,7 +17,10 @@ v1Router.use('/users', userRouter);
 v1Router.use('/departments', departmentRouter);
 v1Router.use('/categories', categoryRouter);
 v1Router.use('/requests', requestRouter);
+v1Router.use('/requests', messagingRouter);
 v1Router.use('/staff', staffQueueRouter);
+v1Router.use('/staff/requests', staffMessagingRouter);
+v1Router.use('/attachments', attachmentRouter);
 v1Router.use('/admin/settings', systemSettingsRouter);
 
 export default v1Router;

@@ -38,6 +38,12 @@ const envSchema = z.object({
     .string()
     .default('false')
     .transform((val) => val === 'true'),
+  STORAGE_LOCAL_DIR: z.string().default('./uploads'),
+  STORAGE_MAX_FILE_SIZE_BYTES: z
+    .string()
+    .regex(/^\d+$/, 'STORAGE_MAX_FILE_SIZE_BYTES must be numeric')
+    .default('10485760')
+    .transform(Number),
 });
 
 const parsed = envSchema.safeParse(process.env);

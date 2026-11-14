@@ -418,6 +418,108 @@ export class RequestWorkflowRepository {
   }
 
   /**
+   * Reopens a closed request on behalf of an authorised staff member (last handler).
+   * Identical enforcement to reopenRequest() except:
+   * - No student ownership check (the caller service must verify last-handler status).
+   * - actor = staffUserId (recorded in updated_by and in lifecycle history via trigger).
+   * - Enforces same reopen_count limit and time-window as student reopening.
+   */
+  async reopenRequestByStaff(
+    requestId: string,
+    staffUserId: string,
+    reason: string,
+    maxReopenCount: number,
+    reopenWindowDays: number,
+  ): Promise<RequestRecord> {
+    const client: PoolClient = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // 1. Lock request row FOR UPDATE
+      const reqRes = await client.query(
+        `SELECT id, status, current_authority_level_id, reopen_count,
+                first_closed_at, closed_at, resolved_at, deleted_at
+         FROM requests
+         WHERE id = $1
+         FOR UPDATE;`,
+        [requestId],
+      );
+
+      if (reqRes.rows.length === 0 || reqRes.rows[0].deleted_at !== null) {
+        const notFoundErr = new Error(`Request ${requestId} not found`);
+        (notFoundErr as unknown as { code: string }).code = 'not_found';
+        throw notFoundErr;
+      }
+
+      const req = reqRes.rows[0];
+
+      // 2. Can only reopen from closed status
+      if (req.status !== 'closed') {
+        if (req.status === 'rejected') {
+          const rejectedErr = new Error('Rejected requests are final and cannot be reopened');
+          (rejectedErr as unknown as { code: string }).code = 'rejection_final';
+          throw rejectedErr;
+        }
+
+        const invalidStatusErr = new Error(
+          `Request cannot be reopened from status '${req.status}'. Only 'closed' requests can be reopened.`,
+        );
+        (invalidStatusErr as unknown as { code: string }).code = 'invalid_transition';
+        throw invalidStatusErr;
+      }
+
+      // 3. Enforce maximum reopen count limit
+      const currentReopenCount = Number(req.reopen_count ?? 0);
+      if (currentReopenCount >= maxReopenCount) {
+        const limitErr = new Error(
+          `This request has reached the maximum allowed number of reopenings (${maxReopenCount}).`,
+        );
+        (limitErr as unknown as { code: string }).code = 'reopen_limit_exceeded';
+        throw limitErr;
+      }
+
+      // 4. Enforce reopening time window against the immutable first closure timestamp
+      const anchorDate = req.first_closed_at ?? req.closed_at ?? req.resolved_at ?? new Date();
+      const windowMs = reopenWindowDays * 24 * 60 * 60 * 1000;
+      const windowDeadline = new Date(new Date(anchorDate).getTime() + windowMs);
+
+      if (Date.now() > windowDeadline.getTime()) {
+        const windowErr = new Error(
+          `The reopening time window of ${reopenWindowDays} days has expired. Request can no longer be reopened.`,
+        );
+        (windowErr as unknown as { code: string }).code = 'window_expired';
+        throw windowErr;
+      }
+
+      // 5. Update request to pending — authority level strictly preserved
+      await client.query(
+        `UPDATE requests
+         SET status = 'pending',
+             current_assignment_id = NULL,
+             reopen_count = reopen_count + 1,
+             last_reopen_reason = $1,
+             updated_by = $2,
+             updated_at = NOW()
+         WHERE id = $3;`,
+        [reason, staffUserId, requestId],
+      );
+
+      const updated = await requestRepository.findById(requestId, client);
+      if (!updated) {
+        throw new Error('Failed to retrieve updated request');
+      }
+
+      await client.query('COMMIT');
+      return updated;
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
    * Returns an assigned or in-progress request back to its department authority queue.
    * Business rules:
    * 1. Only the currently assigned staff member may return their request.

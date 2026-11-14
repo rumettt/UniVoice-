@@ -132,16 +132,8 @@ describe('Student Reopening & Request Tracking (Phase 6)', () => {
     });
   });
 
-  describe('POST /api/v1/requests/:requestId/reopen', () => {
-    it('1. owning student can reopen an eligible closed request', async () => {
-      vi.spyOn(requestWorkflowRepository, 'reopenRequest').mockResolvedValueOnce({
-        ...mockClosedRequest,
-        status: 'pending',
-        currentAssignmentId: null,
-        reopenCount: 1,
-        lastReopenReason: 'Amount deducted still differs from waiver notice.',
-      });
-
+  describe('POST /api/v1/requests/:requestId/reopen (Deprecated in Phase 7 Milestone 2)', () => {
+    it('1. student-initiated reopening returns 410 Gone', async () => {
       const res = await request(app)
         .post(`/api/v1/requests/${requestId}/reopen`)
         .set('Authorization', `Bearer ${student1Token}`)
@@ -149,104 +141,20 @@ describe('Student Reopening & Request Tracking (Phase 6)', () => {
           reason: 'Amount deducted still differs from waiver notice.',
         });
 
-      expect(res.status).toBe(200);
-      expect(res.body.status).toBe('success');
-      expect(res.body.data.request.status).toBe('pending');
-      expect(res.body.data.request.reopenCount).toBe(1);
-      expect(res.body.data.request.currentAssignmentId).toBeNull();
-      // Authority level is preserved at Level 2
-      expect(res.body.data.request.currentAuthorityLevelId).toBe('a0000000-0000-4000-8000-000000000032');
+      expect(res.status).toBe(410);
+      expect(res.body.status).toBe('error');
+      expect(res.body.message).toContain('no longer available');
     });
 
-    it("2. another student cannot reopen the request (returns 404 without leaking data)", async () => {
-      const err = new Error(`Request ${requestId} not found`);
-      (err as unknown as { code: string }).code = 'not_found';
-      vi.spyOn(requestWorkflowRepository, 'reopenRequest').mockRejectedValueOnce(err);
-
+    it('2. unauthenticated request returns 410 Gone (deprecated endpoint)', async () => {
       const res = await request(app)
         .post(`/api/v1/requests/${requestId}/reopen`)
-        .set('Authorization', `Bearer ${student2Token}`)
         .send({
-          reason: 'Trying to reopen someone else request',
+          reason: 'Trying to reopen without auth',
         });
 
-      expect(res.status).toBe(404);
-      expect(res.body.message).toContain('not found');
-    });
-
-    it('3. rejects missing or blank reopening reason with 400', async () => {
-      const missingReason = await request(app)
-        .post(`/api/v1/requests/${requestId}/reopen`)
-        .set('Authorization', `Bearer ${student1Token}`)
-        .send({});
-      expect(missingReason.status).toBe(400);
-
-      const blankReason = await request(app)
-        .post(`/api/v1/requests/${requestId}/reopen`)
-        .set('Authorization', `Bearer ${student1Token}`)
-        .send({
-          reason: '   ',
-        });
-      expect(blankReason.status).toBe(400);
-    });
-
-    it('4. rejects reopening a rejected request with 400 (rejection is final)', async () => {
-      const err = new Error('Rejected requests are final and cannot be reopened');
-      (err as unknown as { code: string }).code = 'rejection_final';
-      vi.spyOn(requestWorkflowRepository, 'reopenRequest').mockRejectedValueOnce(err);
-
-      const res = await request(app)
-        .post(`/api/v1/requests/${requestId}/reopen`)
-        .set('Authorization', `Bearer ${student1Token}`)
-        .send({
-          reason: 'I want to appeal the rejection',
-        });
-
-      expect(res.status).toBe(400);
-      expect(res.body.message).toContain('final');
-    });
-
-    it('5. rejects reopening when request is outside the allowed time window (400)', async () => {
-      const err = new Error('The reopening time window of 7 days has expired. Request can no longer be reopened.');
-      (err as unknown as { code: string }).code = 'window_expired';
-      vi.spyOn(requestWorkflowRepository, 'reopenRequest').mockRejectedValueOnce(err);
-
-      const res = await request(app)
-        .post(`/api/v1/requests/${requestId}/reopen`)
-        .set('Authorization', `Bearer ${student1Token}`)
-        .send({
-          reason: 'Too late reopening',
-        });
-
-      expect(res.status).toBe(400);
-      expect(res.body.message).toContain('expired');
-    });
-
-    it('6. rejects reopening beyond the maximum allowed count (400)', async () => {
-      const err = new Error('This request has reached the maximum allowed number of reopenings (2).');
-      (err as unknown as { code: string }).code = 'reopen_limit_exceeded';
-      vi.spyOn(requestWorkflowRepository, 'reopenRequest').mockRejectedValueOnce(err);
-
-      const res = await request(app)
-        .post(`/api/v1/requests/${requestId}/reopen`)
-        .set('Authorization', `Bearer ${student1Token}`)
-        .send({
-          reason: 'Third attempt',
-        });
-
-      expect(res.status).toBe(400);
-      expect(res.body.message).toContain('maximum');
-    });
-
-    it('7. non-student users are rejected with 403', async () => {
-      const res = await request(app)
-        .post(`/api/v1/requests/${requestId}/reopen`)
-        .set('Authorization', `Bearer ${staffToken}`)
-        .send({
-          reason: 'Staff cannot reopen',
-        });
-
-      expect(res.status).toBe(403);
+      expect(res.status).toBe(410);
+      expect(res.body.message).toContain('no longer available');
     });
   });
 

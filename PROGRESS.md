@@ -14,7 +14,57 @@ This document tracks project implementation milestones, completed phases, key ar
 | **Phase 4** | Request Submission & Student Workflow | ✅ Completed | 2026-11-09 |
 | **Phase 5** | Staff Queues, Escalation & Approvals | ✅ Completed | 2026-11-09 |
 | **Phase 6** | Request Workflow & Student Reopening | ✅ Completed | 2026-11-12 |
-| **Phase 7** | Escalation & Reassignment | 🟡 In Progress (Milestone 1 Completed) | — |
+| **Phase 7** | Escalation & Reassignment | 🟡 In Progress (Milestones 1 & 2 Completed) | — |
+
+---
+
+## Phase 7: Escalation & Reassignment — Milestone 2: Closed-Request Communication and Messaging (Completed)
+
+### 1. Implemented Features
+
+- **Student Messaging on Closed Requests (`POST /api/v1/requests/:requestId/messages`):**
+  - Allows students to post follow-up messages on their own `closed` requests.
+  - Sending a message does **NOT** alter the request status (it remains `closed`).
+  - Strict privacy and anti-enumeration: Request must exist, be closed, and belong to the authenticated student (`404 Not Found` for other students).
+  - Messages are saved to `comments` with `visibility = 'student_visible'`.
+- **Student Conversation Retrieval (`GET /api/v1/requests/:requestId/messages`):**
+  - Allows students to fetch student-visible messages on their closed requests, with pagination (`page`, `limit`).
+- **Staff Conversation Retrieval (`GET /api/v1/staff/requests/:requestId/messages`):**
+  - Allows the last assigned staff handler to inspect the closed request's conversation.
+  - Non-handlers receive `403 Forbidden`.
+- **Staff Reply (`POST /api/v1/staff/requests/:requestId/messages`):**
+  - Last handler staff can send a response to the student, preserving conversation history and keeping status `closed`.
+- **Staff Reopening (`POST /api/v1/staff/requests/:requestId/reopen-closed`):**
+  - Replaces student-facing direct reopening. Last handler staff can reopen an eligible closed request with a mandatory non-empty reason.
+  - Enforces system settings (`maxReopenCount`, `reopenWindowDays`) and increments `reopen_count`.
+  - Re-queues the request in `pending` status at the preserved authority level with `current_assignment_id = NULL`.
+- **Staff Rejection of Further Action (`POST /api/v1/staff/requests/:requestId/reject-further`):**
+  - Last handler staff can permanently deny further action with an explanation visible to the student (`comments` table) and logged in `request_history` (`action = 'further_action_rejected'`).
+  - Request remains `closed`.
+- **Deprecation of Student Reopen Endpoint (`POST /api/v1/requests/:requestId/reopen`):**
+  - Returns `410 Gone` with a helpful message directing the student to post a message instead.
+- **Provider-Independent Attachment Storage Abstraction (`src/utils/storage`):**
+  - Storage adapter interface (`store`, `getSignedUrl`, `delete`) decoupling storage backends from PostgreSQL metadata.
+  - `LocalStorageAdapter` for development and testing with UUID-prefixed safe filenames and path-traversal guards.
+  - S3-compatible interface ready for production deployment.
+  - Attachment upload endpoints (`POST /api/v1/requests/:requestId/messages/attachments` and `POST /api/v1/staff/requests/:requestId/messages/attachments`) with MIME validation and size limits.
+  - Secure authorized download (`GET /api/v1/attachments/:attachmentId`) with access checks for student owners, staff handlers, and admins.
+
+### 2. Database & Performance Refinements
+
+- Database migration `database/migrations/V004__messaging.sql` adds covering index `idx_comments_request_visible_paginate` on `comments(request_id, created_at ASC) WHERE deleted_at IS NULL AND visibility = 'student_visible'`.
+- Greenfield schema `16_indexes.sql` updated to include the performance index.
+
+### 3. Focused Verification & Hardening Results
+
+- **A. Last-Handler Identification**: Hardened `getLastHandler` in `messaging.repository.ts` to sort by `(ended_at IS NULL) DESC, COALESCE(ended_at, started_at) DESC, started_at DESC`, guaranteeing the staff member who actually brought the request to resolution/closure is selected rather than an earlier returned assignee whose started_at might be ambiguous in rapid reassignment cycles.
+- **B. Unavailable Last Handler**: Verified that student messages remain associated with the last handler, do not enter any general queue, and do not change request status (`closed` preserved).
+- **C. Attachment Security**:
+  - Implemented `validateBufferContent` in `messaging.service.ts` checking magic bytes (rejects executables including Windows PE `MZ`, Linux ELF, Mach-O, and verifies file signatures for PDF `%PDF`, JPEG, PNG, GIF, and WebP).
+  - Enforced strict authorization against request ownership and handler context for all downloads.
+- **D. Storage & Database Consistency**: Verified transactional isolation and rollback cleanup logic: if the metadata insertion fails, the uploaded storage file is immediately cleaned up via `storageAdapter.delete()`.
+- **E. Staff Reopening Policy Alignment**: Aligned `reopenRequestByStaff()` in `requestWorkflow.repository.ts` with student reopening rules, adding an explicit check that rejects attempts to reopen `rejected` requests (`400 Bad Request`, `rejection_final`).
+- **Test Suite Status**: 18 test files, 175 unit tests passing (5 new verification tests added). Production build and typecheck passing with zero errors.
 
 ---
 
