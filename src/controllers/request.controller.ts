@@ -5,6 +5,7 @@ import {
   requestQuerySchema,
   requestIdParamSchema,
 } from '../validators/request.validators';
+import { reopenRequestSchema } from '../validators/requestWorkflow.validators';
 import { AppError } from '../utils/AppError';
 
 /**
@@ -74,6 +75,36 @@ export async function getRequestById(req: Request, res: Response): Promise<void>
   const request = await requestService.getRequestDetails(
     req.user.id,
     parseResult.data.requestId,
+  );
+
+  res.status(200).json({
+    status: 'success',
+    data: { request },
+  });
+}
+
+/**
+ * POST /api/v1/requests/:requestId/reopen
+ * Reopens a closed request by the owning student.
+ */
+export async function reopenRequest(req: Request, res: Response): Promise<void> {
+  const studentUserId = req.user!.id;
+  const paramResult = requestIdParamSchema.safeParse(req.params);
+  if (!paramResult.success) {
+    const errorMsg = paramResult.error.issues.map((i) => i.message).join(', ');
+    throw new AppError(`Validation failed: ${errorMsg}`, 400);
+  }
+
+  const bodyResult = reopenRequestSchema.safeParse(req.body);
+  if (!bodyResult.success) {
+    const errorMsg = bodyResult.error.issues.map((i) => i.message).join(', ');
+    throw new AppError(`Validation failed: ${errorMsg}`, 400);
+  }
+
+  const request = await requestService.reopenRequest(
+    studentUserId,
+    paramResult.data.requestId,
+    bodyResult.data,
   );
 
   res.status(200).json({

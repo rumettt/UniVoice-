@@ -20,3 +20,4 @@
 \ir schema/15_triggers.sql
 \ir schema/16_indexes.sql
 \ir schema/17_reporting_views.sql
+\ir schema/18_system_settings.sql

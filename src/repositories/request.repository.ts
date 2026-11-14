@@ -21,11 +21,15 @@ export interface RequestRecord {
   priority: 'low' | 'medium' | 'high' | 'urgent';
   status: 'pending' | 'assigned' | 'in_progress' | 'resolved' | 'closed' | 'rejected';
   dueAt: Date | null;
+  resolutionCategory?: string | null;
   resolutionNotes: string | null;
   resolvedAt: Date | null;
   closedAt: Date | null;
+  firstClosedAt?: Date | null;
   rejectedAt: Date | null;
+  rejectionReason?: string | null;
   reopenCount: number;
+  lastReopenReason?: string | null;
   deletedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
@@ -48,6 +52,68 @@ export interface RequestRecord {
     name: string;
     levelOrder: number;
   };
+}
+
+export interface StudentVisibleHistoryItem {
+  id: string;
+  action: string;
+  status: string;
+  actorRole?: string;
+  actorName?: string;
+  timestamp: Date;
+  details?: {
+    source?: string;
+    resolutionCategory?: string;
+    resolutionNotes?: string;
+    rejectionReason?: string;
+    reopenReason?: string;
+    reopenCount?: number;
+  };
+}
+
+export interface StudentRequestTrackingRecord {
+  id: string;
+  publicRef: string;
+  title: string;
+  description: string;
+  status: string;
+  priority: string;
+  department: {
+    id: string;
+    name: string;
+    code: string;
+  };
+  category: {
+    id: string;
+    name: string;
+  };
+  assignedStaff: {
+    fullName: string;
+    email: string;
+  } | null;
+  dates: {
+    createdAt: Date;
+    updatedAt: Date;
+    resolvedAt: Date | null;
+    closedAt: Date | null;
+    rejectedAt: Date | null;
+  };
+  resolution: {
+    category: string | null;
+    message: string | null;
+  } | null;
+  rejection: {
+    reason: string | null;
+  } | null;
+  reopening: {
+    isAllowed: boolean;
+    remainingReopenings: number;
+    maxReopenCount: number;
+    windowExpiresAt: Date | null;
+    remainingWindowSeconds: number | null;
+    lastReopenReason: string | null;
+  };
+  history: StudentVisibleHistoryItem[];
 }
 
 export interface LockedCategoryRouting {
@@ -88,11 +154,15 @@ export class RequestRepository {
         r.priority,
         r.status,
         r.due_at AS "dueAt",
+        r.resolution_category AS "resolutionCategory",
         r.resolution_notes AS "resolutionNotes",
         r.resolved_at AS "resolvedAt",
         r.closed_at AS "closedAt",
+        r.first_closed_at AS "firstClosedAt",
         r.rejected_at AS "rejectedAt",
+        r.rejection_reason AS "rejectionReason",
         r.reopen_count AS "reopenCount",
+        r.last_reopen_reason AS "lastReopenReason",
         r.deleted_at AS "deletedAt",
         r.created_at AS "createdAt",
         r.updated_at AS "updatedAt",
@@ -292,11 +362,15 @@ export class RequestRepository {
         r.priority,
         r.status,
         r.due_at AS "dueAt",
+        r.resolution_category AS "resolutionCategory",
         r.resolution_notes AS "resolutionNotes",
         r.resolved_at AS "resolvedAt",
         r.closed_at AS "closedAt",
+        r.first_closed_at AS "firstClosedAt",
         r.rejected_at AS "rejectedAt",
+        r.rejection_reason AS "rejectionReason",
         r.reopen_count AS "reopenCount",
+        r.last_reopen_reason AS "lastReopenReason",
         r.deleted_at AS "deletedAt",
         r.created_at AS "createdAt",
         r.updated_at AS "updatedAt",
@@ -319,6 +393,74 @@ export class RequestRepository {
     return { requests, total };
   }
 
+  /**
+   * Retrieves student-safe request history timeline without leaking internal administrative metadata.
+   */
+  async findStudentHistory(requestId: string, client?: PoolClient): Promise<StudentVisibleHistoryItem[]> {
+    const executor = client ?? pool;
+    const query = `
+      SELECT
+        rh.id,
+        rh.action,
+        rh.new_value AS "status",
+        rh.details,
+        rh.created_at AS "timestamp",
+        u.role AS "actorRole",
+        u.full_name AS "actorName"
+      FROM request_history rh
+      LEFT JOIN users u ON u.id = rh.actor_id
+      WHERE rh.request_id = $1
+      ORDER BY rh.created_at ASC;
+    `;
+
+    const res = await executor.query(query, [requestId]);
+    return res.rows.map((row) => {
+      const details = row.details ?? {};
+      return {
+        id: row.id,
+        action: row.action,
+        status: row.status ?? row.action,
+        actorRole: row.actorRole === 'student' ? 'student' : row.actorRole === 'staff' ? 'staff' : undefined,
+        actorName: row.actorRole === 'student' ? undefined : (row.actorName ?? undefined),
+        timestamp: row.timestamp,
+        details: {
+          source: details.source,
+          resolutionCategory: details.resolution_category,
+          resolutionNotes: details.resolution_notes,
+          rejectionReason: details.rejection_reason,
+          reopenReason: details.reopen_reason,
+          reopenCount: details.reopen_count != null ? Number(details.reopen_count) : undefined,
+        },
+      };
+    });
+  }
+
+  /**
+   * Retrieves the currently assigned staff member, or the last staff member who handled the request.
+   */
+  async getAssignedOrLastStaff(
+    requestId: string,
+    client?: PoolClient,
+  ): Promise<{ fullName: string; email: string } | null> {
+    const executor = client ?? pool;
+    const query = `
+      SELECT u.full_name AS "fullName", u.email
+      FROM request_assignments ra
+      JOIN users u ON u.id = ra.assignee_id
+      WHERE ra.request_id = $1
+      ORDER BY (ra.ended_at IS NULL) DESC, ra.started_at DESC
+      LIMIT 1;
+    `;
+    const res = await executor.query(query, [requestId]);
+    if (res.rows.length === 0) {
+      return null;
+    }
+    return {
+      fullName: res.rows[0].fullName,
+      email: res.rows[0].email,
+    };
+  }
+
   private mapRowToRecord(row: Record<string, unknown>): RequestRecord {
     return {
       id: row.id as string,
@@ -339,11 +481,15 @@ export class RequestRepository {
       priority: row.priority as 'low' | 'medium' | 'high' | 'urgent',
       status: row.status as 'pending' | 'assigned' | 'in_progress' | 'resolved' | 'closed' | 'rejected',
       dueAt: (row.dueAt as Date | null) ?? null,
+      resolutionCategory: (row.resolutionCategory as string | null) ?? null,
       resolutionNotes: (row.resolutionNotes as string | null) ?? null,
       resolvedAt: (row.resolvedAt as Date | null) ?? null,
       closedAt: (row.closedAt as Date | null) ?? null,
+      firstClosedAt: (row.firstClosedAt as Date | null) ?? null,
       rejectedAt: (row.rejectedAt as Date | null) ?? null,
+      rejectionReason: (row.rejectionReason as string | null) ?? null,
       reopenCount: Number(row.reopenCount ?? 0),
+      lastReopenReason: (row.lastReopenReason as string | null) ?? null,
       deletedAt: (row.deletedAt as Date | null) ?? null,
       createdAt: row.createdAt as Date,
       updatedAt: row.updatedAt as Date,

@@ -394,8 +394,96 @@ BEGIN
   END IF;
   RAISE NOTICE 'Test 12 Passed: Highest authority level correctly raises exception on escalation';
 
+  -- -----------------------------------------------------------------
+  -- Test 13: Staff returns request to queue with mandatory reason
+  -- -----------------------------------------------------------------
+  -- Create new Level 1 request and claim by Staff 2
+  INSERT INTO requests (
+    public_ref, title, description, student_id, category_id,
+    responsible_department_id, current_authority_level_id, created_by
+  ) VALUES (
+    'REQ-2026-RET1', 'Return Test', 'Return to queue test',
+    v_student_user_id, v_cat_id, v_dept_id, v_level_1_id, v_student_user_id
+  ) RETURNING id INTO v_req_id;
+
+  v_assignment_id := claim_request(v_req_id, v_staff_2_user_id);
+
+  -- Return to queue
+  PERFORM return_request_to_queue(v_req_id, v_staff_2_user_id, 'Need senior colleague review');
+
+  IF NOT EXISTS (
+    SELECT 1 FROM requests
+    WHERE id = v_req_id
+      AND status = 'pending'
+      AND current_assignment_id IS NULL
+      AND current_authority_level_id = v_level_1_id
+      AND responsible_department_id = v_dept_id
+  ) THEN
+    RAISE EXCEPTION 'Test 13 Failed: Request was not returned to pending queue properly';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM request_assignments
+    WHERE id = v_assignment_id AND ended_at IS NOT NULL
+  ) THEN
+    RAISE EXCEPTION 'Test 13 Failed: Active assignment was not ended upon return';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM request_history
+    WHERE request_id = v_req_id AND action = 'returned_to_queue'
+  ) THEN
+    RAISE EXCEPTION 'Test 13 Failed: Return event was not recorded in history';
+  END IF;
+  RAISE NOTICE 'Test 13 Passed: Request returned to queue, assignment ended, history recorded';
+
+  -- -----------------------------------------------------------------
+  -- Test 14: Non-assignee or empty reason cannot return request
+  -- -----------------------------------------------------------------
+  -- Reclaim request by Staff 2
+  v_assignment_id := claim_request(v_req_id, v_staff_2_user_id);
+
+  -- Attempt return with empty reason
+  v_err_occurred := FALSE;
+  BEGIN
+    PERFORM return_request_to_queue(v_req_id, v_staff_2_user_id, '   ');
+  EXCEPTION WHEN OTHERS THEN
+    v_err_occurred := TRUE;
+  END;
+
+  IF NOT v_err_occurred THEN
+    RAISE EXCEPTION 'Test 14 Failed: Empty reason was allowed on return';
+  END IF;
+
+  -- Attempt return by different staff member (Staff 1)
+  v_err_occurred := FALSE;
+  BEGIN
+    PERFORM return_request_to_queue(v_req_id, v_staff_1_user_id, 'Unauthorized return');
+  EXCEPTION WHEN OTHERS THEN
+    v_err_occurred := TRUE;
+  END;
+
+  IF NOT v_err_occurred THEN
+    RAISE EXCEPTION 'Test 14 Failed: Non-assignee was allowed to return request';
+  END IF;
+  RAISE NOTICE 'Test 14 Passed: Empty reason and unauthorized staff correctly rejected on return';
+
+  -- -----------------------------------------------------------------
+  -- Test 15: Return and reclaim by previous handler succeeds
+  -- -----------------------------------------------------------------
+  PERFORM return_request_to_queue(v_req_id, v_staff_2_user_id, 'Temporary pause');
+  v_assignment_id := claim_request(v_req_id, v_staff_2_user_id);
+
+  IF NOT EXISTS (
+    SELECT 1 FROM requests
+    WHERE id = v_req_id AND status = 'assigned' AND current_assignment_id = v_assignment_id
+  ) THEN
+    RAISE EXCEPTION 'Test 15 Failed: Previous handler could not reclaim returned request';
+  END IF;
+  RAISE NOTICE 'Test 15 Passed: Previous handler successfully reclaimed returned request';
+
   RAISE NOTICE '=====================================================';
-  RAISE NOTICE 'All 12 UniVoice validation tests PASSED successfully!';
+  RAISE NOTICE 'All 15 UniVoice validation tests PASSED successfully!';
   RAISE NOTICE '=====================================================';
 END $$;
 

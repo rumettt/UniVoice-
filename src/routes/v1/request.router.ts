@@ -6,6 +6,7 @@ import {
   submitRequest,
   getMyRequests,
   getRequestById,
+  reopenRequest,
 } from '../../controllers/request.controller';
 
 const requestRouter = Router();
@@ -30,6 +31,13 @@ requestRouter.get(
   authenticate,
   requireRole('student'),
   asyncHandler(getRequestById),
+);
+
+requestRouter.post(
+  '/:requestId/reopen',
+  authenticate,
+  requireRole('student'),
+  asyncHandler(reopenRequest),
 );
 
 export default requestRouter;

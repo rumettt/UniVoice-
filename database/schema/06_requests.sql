@@ -20,11 +20,15 @@ CREATE TABLE requests (
   priority                    VARCHAR(20) NOT NULL DEFAULT 'medium',
   status                      VARCHAR(20) NOT NULL DEFAULT 'pending',
   due_at                      TIMESTAMPTZ,
+  resolution_category         VARCHAR(100),
   resolution_notes            TEXT,
   resolved_at                 TIMESTAMPTZ,
   closed_at                   TIMESTAMPTZ,
+  first_closed_at             TIMESTAMPTZ,
   rejected_at                 TIMESTAMPTZ,
+  rejection_reason            TEXT,
   reopen_count                INTEGER NOT NULL DEFAULT 0,
+  last_reopen_reason          TEXT,
   deleted_at                  TIMESTAMPTZ,
   created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -53,6 +57,20 @@ CREATE TABLE requests (
     CHECK (status <> 'closed' OR closed_at IS NOT NULL),
   CONSTRAINT requests_rejected_has_rejected_at
     CHECK (status <> 'rejected' OR rejected_at IS NOT NULL),
+  CONSTRAINT requests_resolution_category_allowed
+    CHECK (resolution_category IS NULL OR resolution_category IN (
+      'resolved_fully',
+      'workaround_provided',
+      'information_provided',
+      'referred_to_external',
+      'other'
+    )),
+  CONSTRAINT requests_resolved_has_category
+    CHECK (status <> 'resolved' OR resolution_category IS NOT NULL),
+  CONSTRAINT requests_resolved_has_notes
+    CHECK (status <> 'resolved' OR btrim(COALESCE(resolution_notes, '')) <> ''),
+  CONSTRAINT requests_rejected_has_reason
+    CHECK (status <> 'rejected' OR btrim(COALESCE(rejection_reason, '')) <> ''),
   CONSTRAINT requests_lifecycle_timestamps
     CHECK (
       (resolved_at IS NULL OR resolved_at >= created_at)

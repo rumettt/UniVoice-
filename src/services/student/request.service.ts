@@ -3,12 +3,39 @@ import { pool } from '../../config/db';
 import {
   requestRepository,
   RequestRecord,
+  StudentVisibleHistoryItem,
 } from '../../repositories/request.repository';
+import { requestWorkflowRepository } from '../../repositories/requestWorkflow.repository';
+import { systemSettingsRepository } from '../../repositories/systemSettings.repository';
 import { AppError } from '../../utils/AppError';
 import {
   CreateRequestInput,
   RequestQueryInput,
 } from '../../validators/request.validators';
+import { ReopenRequestInput } from '../../validators/requestWorkflow.validators';
+
+export interface StudentRequestTrackingDetails extends RequestRecord {
+  assignedStaff: {
+    fullName: string;
+    email: string;
+  } | null;
+  resolution: {
+    category: string | null;
+    message: string | null;
+  } | null;
+  rejection: {
+    reason: string | null;
+  } | null;
+  reopening: {
+    isAllowed: boolean;
+    remainingReopenings: number;
+    maxReopenCount: number;
+    windowExpiresAt: Date | null;
+    remainingWindowSeconds: number | null;
+    lastReopenReason: string | null;
+  };
+  history: StudentVisibleHistoryItem[];
+}
 
 export class RequestService {
   /**
@@ -152,7 +179,7 @@ export class RequestService {
   }
 
   /**
-   * Retrieves details of a specific request.
+   * Retrieves comprehensive details and workflow tracking of a specific request.
    * Strictly enforces that students can only access requests they submitted.
    * Returns 404 if the request does not exist or belongs to another student,
    * completely preventing ID enumeration and private data leakage.
@@ -160,14 +187,115 @@ export class RequestService {
   async getRequestDetails(
     studentUserId: string,
     requestId: string,
-  ): Promise<RequestRecord> {
+  ): Promise<StudentRequestTrackingDetails> {
     const request = await requestRepository.findById(requestId);
 
     if (!request || request.studentId !== studentUserId || request.deletedAt !== null) {
       throw new AppError('Request not found', 404);
     }
 
-    return request;
+    // Retrieve workflow settings, staff handler, and student-safe timeline history concurrently
+    const [settings, staffHandler, history] = await Promise.all([
+      systemSettingsRepository.getWorkflowSettings().catch(() => ({
+        reopenWindowDays: 7,
+        maxReopenCount: 2,
+      })),
+      requestRepository.getAssignedOrLastStaff(requestId).catch(() => null),
+      requestRepository.findStudentHistory(requestId).catch(() => []),
+    ]);
+
+    const isClosed = request.status === 'closed';
+    const remainingReopenings = Math.max(0, settings.maxReopenCount - (request.reopenCount ?? 0));
+
+    let isAllowed = false;
+    let windowExpiresAt: Date | null = null;
+    let remainingWindowSeconds: number | null = null;
+
+    const anchorDate = request.firstClosedAt ?? request.closedAt ?? request.resolvedAt;
+    if (isClosed && anchorDate) {
+      const windowMs = settings.reopenWindowDays * 24 * 60 * 60 * 1000;
+      windowExpiresAt = new Date(new Date(anchorDate).getTime() + windowMs);
+      const remainingMs = windowExpiresAt.getTime() - Date.now();
+      if (remainingMs > 0) {
+        remainingWindowSeconds = Math.floor(remainingMs / 1000);
+        isAllowed = remainingReopenings > 0;
+      } else {
+        remainingWindowSeconds = 0;
+        isAllowed = false;
+      }
+    }
+
+    return {
+      ...request,
+      assignedStaff: staffHandler,
+      resolution:
+        request.resolutionCategory || request.resolutionNotes
+          ? {
+              category: request.resolutionCategory ?? null,
+              message: request.resolutionNotes ?? null,
+            }
+          : null,
+      rejection: request.rejectionReason
+        ? {
+            reason: request.rejectionReason,
+          }
+        : null,
+      reopening: {
+        isAllowed,
+        remainingReopenings,
+        maxReopenCount: settings.maxReopenCount,
+        windowExpiresAt,
+        remainingWindowSeconds,
+        lastReopenReason: request.lastReopenReason ?? null,
+      },
+      history,
+    };
+  }
+
+  /**
+   * Reopens a closed request by the owning student.
+   */
+  async reopenRequest(
+    studentUserId: string,
+    requestId: string,
+    input: ReopenRequestInput,
+  ): Promise<RequestRecord> {
+    const settings = await systemSettingsRepository.getWorkflowSettings();
+
+    try {
+      return await requestWorkflowRepository.reopenRequest(
+        requestId,
+        studentUserId,
+        input.reason,
+        settings.maxReopenCount,
+        settings.reopenWindowDays,
+      );
+    } catch (err: unknown) {
+      if (err instanceof AppError) {
+        throw err;
+      }
+
+      if (err && typeof err === 'object' && 'code' in err) {
+        const customErr = err as { code: string; message: string };
+        if (customErr.code === 'not_found') {
+          throw new AppError('Request not found', 404);
+        }
+        if (customErr.code === 'rejection_final') {
+          throw new AppError(customErr.message, 400);
+        }
+        if (customErr.code === 'invalid_transition') {
+          throw new AppError(customErr.message, 400);
+        }
+        if (customErr.code === 'reopen_limit_exceeded') {
+          throw new AppError(customErr.message, 400);
+        }
+        if (customErr.code === 'window_expired') {
+          throw new AppError(customErr.message, 400);
+        }
+      }
+
+      throw err;
+    }
   }
 }
 

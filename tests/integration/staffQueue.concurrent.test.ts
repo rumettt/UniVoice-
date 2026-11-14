@@ -68,23 +68,28 @@ function makeClient(): Client {
 /** Seed the minimum rows needed for the concurrent-claim test. */
 async function seed(db: Client): Promise<void> {
   // Department
+  const DEPT_NAME = `Integration Test Dept ${DEPT_ID}`;
+  const DEPT_CODE = `INT${DEPT_ID.slice(0, 8).replace(/-/g, '').toUpperCase()}`;
   await db.query(
     `INSERT INTO departments (id, name, code, default_max_active_requests, is_active)
-     VALUES ($1, 'Integration Test Dept', 'INTTEST', 5, TRUE)`,
-    [DEPT_ID],
+     VALUES ($1, $2, $3, 5, TRUE)
+     ON CONFLICT (name) DO NOTHING`,
+    [DEPT_ID, DEPT_NAME, DEPT_CODE],
   );
 
   // Staff user + staff_profile
+  const STAFF_EMAIL = `intstaff_${STAFF_ID}@test.local`;
   await db.query(
     `INSERT INTO users (id, first_name, last_name, email, password_hash, role,
                         primary_department_id, is_active)
-     VALUES ($1, 'Int', 'Staff', 'intstaff@test.local', 'x', 'staff', $2, TRUE)`,
-    [STAFF_ID, DEPT_ID],
+     VALUES ($1, 'Int', 'Staff', $2, 'x', 'staff', $3, TRUE)
+     ON CONFLICT (email) DO NOTHING`,
+    [STAFF_ID, STAFF_EMAIL, DEPT_ID],
   );
   await db.query(
     `INSERT INTO staff_profiles (user_id, employee_number)
-     VALUES ($1, 'INT-STAFF-001')`,
-    [STAFF_ID],
+     VALUES ($1, $2)`,
+    [STAFF_ID, `STF-${STAFF_ID.slice(0, 8)}`],
   );
 
   // Department membership
@@ -122,8 +127,8 @@ async function seed(db: Client): Promise<void> {
   // Category
   await db.query(
     `INSERT INTO categories
-       (id, department_id, initial_authority_level_id, name, code, is_active)
-     VALUES ($1, $2, $3, 'Integration Category', 'INTCAT', TRUE)`,
+       (id, department_id, initial_authority_level_id, name, is_active)
+     VALUES ($1, $2, $3, 'Integration Category', TRUE)`,
     [CAT_ID, DEPT_ID, LEVEL_ID],
   );
 
@@ -136,51 +141,59 @@ async function seed(db: Client): Promise<void> {
   );
 
   // Student submitter (needed for FK on requests)
+  const STUDENT_EMAIL = `intstudent_${STUDENT_ID}@test.local`;
   await db.query(
     `INSERT INTO users (id, first_name, last_name, email, password_hash, role, is_active)
-     VALUES ($1, 'Int', 'Student', 'intstudent@test.local', 'x', 'student', TRUE)`,
-    [STUDENT_ID],
+     VALUES ($1, 'Int', 'Student', $2, 'x', 'student', TRUE)`,
+    [STUDENT_ID, STUDENT_EMAIL],
   );
   await db.query(
     `INSERT INTO student_profiles (user_id, student_number)
-     VALUES ($1, 'S-INT-001')`,
-    [STUDENT_ID],
+     VALUES ($1, $2)`,
+    [STUDENT_ID, `STU-${STUDENT_ID.slice(0, 8)}`],
   );
 
   // Two pending requests
-  for (const [reqId, publicRef] of [
-    [REQ_ID_A, 'REQ-TEST-00001'],
-    [REQ_ID_B, 'REQ-TEST-00002'],
+  for (const [reqId, idx] of [
+    [REQ_ID_A, 'A'],
+    [REQ_ID_B, 'B'],
   ]) {
     await db.query(
       `INSERT INTO requests
-         (id, public_ref, created_by, category_id, responsible_department_id,
+         (id, public_ref, student_id, created_by, category_id, responsible_department_id,
           current_authority_level_id, title, description, priority, status)
-       VALUES ($1, $2, $3, $4, $5, $6, 'Int Test Request', 'Test description', 'medium', 'pending')`,
-      [reqId, publicRef, STUDENT_ID, CAT_ID, DEPT_ID, LEVEL_ID],
+       VALUES ($1, $2, $3, $3, $4, $5, $6, 'Int Test Request', 'Test description', 'medium', 'pending')`,
+      [reqId, `REQ-${reqId.slice(0, 8)}-${idx}`, STUDENT_ID, CAT_ID, DEPT_ID, LEVEL_ID],
     );
   }
 }
 
 /** Remove all seed rows in reverse dependency order. */
 async function cleanup(db: Client): Promise<void> {
-  // History rows (append-only — delete via raw FK if schema allows)
-  await db.query(
-    `DELETE FROM request_history WHERE request_id IN ($1, $2)`,
-    [REQ_ID_A, REQ_ID_B],
-  );
-  await db.query(
-    `DELETE FROM request_assignments WHERE request_id IN ($1, $2)`,
-    [REQ_ID_A, REQ_ID_B],
-  );
-  await db.query(
-    `UPDATE requests SET current_assignment_id = NULL WHERE id IN ($1, $2)`,
-    [REQ_ID_A, REQ_ID_B],
-  );
-  await db.query(
-    `DELETE FROM requests WHERE id IN ($1, $2)`,
-    [REQ_ID_A, REQ_ID_B],
-  );
+  // Temporarily disable the immutability trigger to allow test cleanup
+  await db.query(`ALTER TABLE request_history DISABLE TRIGGER trg_request_history_immutable`);
+  await db.query(`ALTER TABLE request_assignments DISABLE TRIGGER trg_request_assignments_immutable`);
+  try {
+    await db.query(
+      `UPDATE requests SET status = 'pending', current_assignment_id = NULL WHERE id IN ($1, $2)`,
+      [REQ_ID_A, REQ_ID_B],
+    );
+    await db.query(
+      `DELETE FROM request_assignments WHERE request_id IN ($1, $2)`,
+      [REQ_ID_A, REQ_ID_B],
+    );
+    await db.query(
+      `DELETE FROM request_history WHERE request_id IN ($1, $2)`,
+      [REQ_ID_A, REQ_ID_B],
+    );
+    await db.query(
+      `DELETE FROM requests WHERE id IN ($1, $2)`,
+      [REQ_ID_A, REQ_ID_B],
+    );
+  } finally {
+    await db.query(`ALTER TABLE request_history ENABLE TRIGGER trg_request_history_immutable`);
+    await db.query(`ALTER TABLE request_assignments ENABLE TRIGGER trg_request_assignments_immutable`);
+  }
   await db.query(
     `DELETE FROM student_profiles WHERE user_id = $1`,
     [STUDENT_ID],

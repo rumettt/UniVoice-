@@ -271,6 +271,58 @@ Returns API availability and database connectivity status.
 - `GET /api/v1/requests/:requestId`: Retrieve details of an individual request *(Student only)*.
   - Restricted to requests submitted by the authenticated student.
   - Returns 404 for nonexistent requests or requests belonging to other students to avoid information leakage.
+  - Enriched with workflow tracking: staff responses, resolution category/message, rejection reasons, student-safe history timeline, and reopening eligibility.
+- `POST /api/v1/requests/:requestId/reopen`: Reopen a closed request back to the pending queue *(Student only)*.
+  - Enforces request ownership (`student_id`).
+  - Allowed only for `closed` requests; rejected requests are final.
+  - Requires mandatory, non-empty reopening reason.
+  - Enforces database-backed global configuration: maximum reopen count (default 2) and time window (default 7 days).
+  - Evaluates against the immutable `first_closed_at` timestamp (reopenings never reset the window).
+  - Preserves the request's current department authority level tier.
+
+---
+
+### Staff Request Workflow (`/api/v1/staff`)
+
+- `PATCH /api/v1/staff/requests/:requestId/start`: Start processing a claimed request *(Staff only)*.
+  - Only the currently assigned staff member can start processing.
+  - Transitions request status from `assigned` to `in_progress`.
+- `POST /api/v1/staff/requests/:requestId/resolve`: Resolve an in-progress request *(Staff only)*.
+  - Only the currently assigned staff member can resolve.
+  - Requires a valid `resolutionCategory` (`resolved_fully`, `workaround_provided`, `information_provided`, `referred_to_external`, `other`) and non-empty `resolutionMessage`.
+  - Atomically transitions `in_progress` → `resolved` → `closed` within a single database transaction.
+  - Releases staff capacity by ending active assignment (`ended_at = NOW()`).
+  - Sets immutable `first_closed_at` on first closure to anchor student reopening window.
+- `POST /api/v1/staff/requests/:requestId/reject`: Reject a request *(Staff only)*.
+  - Staff can reject requests in `assigned` or `in_progress` status.
+  - Requires mandatory non-empty `rejectionReason`.
+  - Releases staff capacity (`ended_at = NOW()`) and sets status to `rejected`.
+  - Rejection is final and cannot be reopened.
+- `POST /api/v1/staff/requests/:requestId/return`: Return an assigned or in-progress request back to its department queue *(Staff only)*.
+  - Only the currently assigned handler can return their request.
+  - Requires mandatory, non-empty `reason`.
+  - Atomically ends the active assignment (`ended_at = NOW()`), releases staff capacity, clears `current_assignment_id`, and transitions request status to `pending`.
+  - Department and authority level are strictly preserved.
+  - Records return reason and action in `request_history`.
+  - Eligible staff (including the previous handler) can reclaim the request via existing queue and atomic claim mechanisms.
+- `POST /api/v1/staff/requests/:requestId/escalate`: Escalate an assigned or in-progress request to the next authority tier *(Staff only)*.
+  - Delegates to authoritative PostgreSQL procedure `escalate_request_to_queue()`.
+  - Only the currently assigned handler can escalate.
+  - Requires mandatory non-empty `reason` and optional `notes`.
+  - Advances request exactly one authority tier higher within the same department (`level_order > current_level_order`).
+  - Atomically ends active assignment, releases staff capacity, sets `status = 'pending'`, clears `current_assignment_id`, and links `current_escalation_id`.
+  - Rejects attempts to escalate beyond the department's highest authority tier with 400.
+  - Repeated escalation is allowed until highest authority tier is reached.
+  - Appends escalation record to `request_escalations` and logs `escalated` event in `request_history`.
+
+---
+
+### Workflow Configuration Settings (`/api/v1/admin/settings`)
+
+- `GET /api/v1/admin/settings/request-workflow`: View current global workflow settings *(Admin only)*.
+- `PATCH /api/v1/admin/settings/request-workflow`: Update global workflow settings *(Admin only)*.
+  - `reopenWindowDays`: positive integer (>= 1).
+  - `maxReopenCount`: integer between 1 and 5.
 
 ---
 

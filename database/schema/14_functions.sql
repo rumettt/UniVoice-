@@ -155,17 +155,53 @@ BEGIN
   END IF;
 
   IF OLD.status IS DISTINCT FROM NEW.status THEN
-    INSERT INTO request_history (
-      request_id, actor_id, action, field_name, old_value, new_value, details
-    ) VALUES (
-      NEW.id,
-      NEW.updated_by,
-      'status_changed',
-      'status',
-      OLD.status,
-      NEW.status,
-      jsonb_build_object('source', 'update')
-    );
+    DECLARE
+      v_details jsonb;
+    BEGIN
+      IF NEW.status = 'in_progress' AND OLD.status = 'assigned' THEN
+        v_details := jsonb_build_object('source', 'start_processing');
+      ELSIF NEW.status = 'resolved' THEN
+        v_details := jsonb_build_object(
+          'source', 'resolve',
+          'resolution_category', NEW.resolution_category,
+          'resolution_notes', NEW.resolution_notes,
+          'resolved_at', NEW.resolved_at
+        );
+      ELSIF NEW.status = 'closed' THEN
+        v_details := jsonb_build_object(
+          'source', 'close',
+          'closed_at', NEW.closed_at,
+          'first_closed_at', NEW.first_closed_at
+        );
+      ELSIF NEW.status = 'rejected' THEN
+        v_details := jsonb_build_object(
+          'source', 'reject',
+          'rejection_reason', NEW.rejection_reason,
+          'rejected_at', NEW.rejected_at
+        );
+      ELSIF OLD.status = 'closed' AND NEW.status = 'pending' THEN
+        v_details := jsonb_build_object(
+          'source', 'reopen',
+          'reopen_count', NEW.reopen_count,
+          'reopen_reason', NEW.last_reopen_reason,
+          'authority_level_id', NEW.current_authority_level_id
+        );
+      ELSE
+        v_details := jsonb_build_object('source', 'update');
+      END IF;
+
+      INSERT INTO request_history (
+        request_id, actor_id, action, field_name, old_value, new_value, details
+      ) VALUES (
+        NEW.id,
+        NEW.updated_by,
+        'status_changed',
+        'status',
+        OLD.status,
+        NEW.status,
+        v_details
+      );
+    END;
   END IF;
 
   IF OLD.priority IS DISTINCT FROM NEW.priority THEN
@@ -237,6 +273,7 @@ DECLARE
   v_staff_level_order    SMALLINT;
   v_assignment_id        UUID;
   v_source               VARCHAR(40);
+  v_active_escalation_id UUID;
 BEGIN
   -- 1. Row-level lock on the request to prevent concurrent claiming race conditions
   SELECT * INTO v_req
@@ -361,27 +398,35 @@ BEGIN
       USING ERRCODE = 'insufficient_privilege';
   END IF;
 
-  -- 8. Create assignment record
+  -- 8. Check if there is an active queued escalation for this request
   IF v_req.current_escalation_id IS NOT NULL THEN
+    SELECT id INTO v_active_escalation_id
+    FROM request_escalations
+    WHERE id = v_req.current_escalation_id
+      AND status = 'queued';
+  END IF;
+
+  IF v_active_escalation_id IS NOT NULL THEN
     v_source := 'escalation_claim';
   ELSE
     v_source := 'claim';
   END IF;
 
+  -- 9. Create assignment record
   INSERT INTO request_assignments (
     request_id, assignee_id, assigned_by, department_id, source, source_escalation_id, started_at
   ) VALUES (
     p_request_id, p_staff_user_id, p_staff_user_id, v_req.responsible_department_id,
-    v_source, v_req.current_escalation_id, NOW()
+    v_source, v_active_escalation_id, NOW()
   ) RETURNING id INTO v_assignment_id;
 
-  -- 9. If request was queued under an escalation, complete that escalation
-  IF v_req.current_escalation_id IS NOT NULL THEN
+  -- 10. If request was queued under an active escalation, complete that escalation
+  IF v_active_escalation_id IS NOT NULL THEN
     UPDATE request_escalations
     SET status = 'claimed',
         claimed_at = NOW(),
         resulting_assignment_id = v_assignment_id
-    WHERE id = v_req.current_escalation_id
+    WHERE id = v_active_escalation_id
       AND status = 'queued';
   END IF;
 
@@ -442,6 +487,11 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'Request % does not exist', p_request_id
       USING ERRCODE = 'no_data_found';
+  END IF;
+
+  IF v_req.deleted_at IS NOT NULL THEN
+    RAISE EXCEPTION 'Request % has been deleted', p_request_id
+      USING ERRCODE = 'object_not_in_prerequisite_state';
   END IF;
 
   IF v_req.status NOT IN ('assigned', 'in_progress') OR v_req.current_assignment_id IS NULL THEN
@@ -524,6 +574,87 @@ BEGIN
   );
 
   RETURN v_escalation_id;
+END;
+$$;
+
+-- Atomically returns an assigned or in-progress request back to its department authority queue
+CREATE OR REPLACE FUNCTION return_request_to_queue(
+  p_request_id    UUID,
+  p_staff_user_id UUID,
+  p_reason        TEXT
+)
+RETURNS UUID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_req                requests%ROWTYPE;
+  v_current_assignment request_assignments%ROWTYPE;
+BEGIN
+  -- Validate mandatory reason
+  IF btrim(COALESCE(p_reason, '')) = '' THEN
+    RAISE EXCEPTION 'Return reason cannot be blank'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  -- 1. Acquire row lock on requests to prevent race conditions
+  SELECT * INTO v_req
+  FROM requests
+  WHERE id = p_request_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Request % does not exist', p_request_id
+      USING ERRCODE = 'no_data_found';
+  END IF;
+
+  IF v_req.deleted_at IS NOT NULL THEN
+    RAISE EXCEPTION 'Request % has been deleted', p_request_id
+      USING ERRCODE = 'object_not_in_prerequisite_state';
+  END IF;
+
+  IF v_req.status NOT IN ('assigned', 'in_progress') OR v_req.current_assignment_id IS NULL THEN
+    RAISE EXCEPTION 'Only actively assigned requests can be returned to queue (current status: %)', v_req.status
+      USING ERRCODE = 'object_not_in_prerequisite_state';
+  END IF;
+
+  -- 2. Verify initiating staff member is the current assignee
+  SELECT * INTO v_current_assignment
+  FROM request_assignments
+  WHERE id = v_req.current_assignment_id;
+
+  IF v_current_assignment.assignee_id <> p_staff_user_id THEN
+    RAISE EXCEPTION 'Only the currently assigned staff member can return this request to the queue'
+      USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  -- 3. End current assignment (releases staff workload capacity)
+  UPDATE request_assignments
+  SET ended_at = NOW()
+  WHERE id = v_req.current_assignment_id;
+
+  -- 4. Move request back to pending queue, clearing active assignment
+  -- Preserves responsible_department_id and current_authority_level_id
+  UPDATE requests
+  SET current_assignment_id = NULL,
+      status = 'pending',
+      updated_by = p_staff_user_id,
+      updated_at = NOW()
+  WHERE id = p_request_id;
+
+  -- 5. Record return-to-queue event in request_history
+  INSERT INTO request_history (
+    request_id, actor_id, action, field_name, old_value, new_value, details
+  ) VALUES (
+    p_request_id, p_staff_user_id, 'returned_to_queue', 'current_assignment_id',
+    v_req.current_assignment_id::text, NULL,
+    jsonb_build_object(
+      'reason', p_reason,
+      'department_id', v_req.responsible_department_id,
+      'authority_level_id', v_req.current_authority_level_id
+    )
+  );
+
+  RETURN v_req.current_assignment_id;
 END;
 $$;
 

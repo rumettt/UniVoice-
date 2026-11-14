@@ -13,7 +13,171 @@ This document tracks project implementation milestones, completed phases, key ar
 | **Phase 3** | User & Department Management | ✅ Completed | 2026-11-06 |
 | **Phase 4** | Request Submission & Student Workflow | ✅ Completed | 2026-11-09 |
 | **Phase 5** | Staff Queues, Escalation & Approvals | ✅ Completed | 2026-11-09 |
-| **Phase 6** | Notifications & Real-Time Updates | ⏳ Upcoming | — |
+| **Phase 6** | Request Workflow & Student Reopening | ✅ Completed | 2026-11-12 |
+| **Phase 7** | Escalation & Reassignment | 🟡 In Progress (Milestone 1 Completed) | — |
+
+---
+
+## Phase 7: Escalation & Reassignment — Milestone 1: Request Return and Escalation (Completed)
+
+### 1. Implemented Features
+
+- **Return to Queue (`POST /api/v1/staff/requests/:requestId/return`):**
+  - Allows the currently assigned staff member to return an assigned or in-progress request back to its department queue.
+  - Strict ownership guard: Only the active handler may return the request; attempts by other staff members are rejected with `403 Forbidden`.
+  - Operational status validation: Requests in `pending`, `resolved`, `closed`, or `rejected` status cannot be returned and are rejected with `400 Bad Request`. Nonexistent or deleted requests return `404 Not Found`.
+  - Mandatory reason: Requires a non-empty, trimmed `reason` validated with Zod. Missing or whitespace-only reasons are rejected with `400 Bad Request`.
+  - Capacity release: Ends the active assignment in `request_assignments` (`ended_at = NOW()`), immediately reducing the staff member's active assignment count and restoring capacity.
+  - Queue restoration: Sets request `status = 'pending'` and resets `current_assignment_id = NULL`.
+  - Department and authority tier preservation: Responsible department and `current_authority_level_id` are strictly preserved without resetting to initial category queues.
+  - Immutable audit history: Records `returned_to_queue` action in `request_history` along with structured JSON details (`reason`, `department_id`, `authority_level_id`).
+  - Reclaim capability: The previous handler remains eligible to reclaim the request through standard queue claiming if another staff member has not claimed it first.
+- **Request Escalation (`POST /api/v1/staff/requests/:requestId/escalate`):**
+  - Exposes the authoritative database procedure `escalate_request_to_queue(p_request_id, p_staff_user_id, p_reason, p_notes)`. Zero duplicate business logic in TypeScript.
+  - Strict ownership guard: Only the currently assigned handler can escalate the request (`403 Forbidden` for other staff members).
+  - Mandatory reason and optional notes: Requires non-empty `reason` and supports optional context notes.
+  - Monotonic authority queue advancement: Advances request exactly one authority tier higher within the same department (`level_order > current_level_order`).
+  - Capacity release: Ends active assignment (`ended_at = NOW()`) and sets `status = 'pending'` in the elevated queue with `current_assignment_id = NULL`.
+  - Escalation history: Inserts sequential record into `request_escalations` (`status = 'queued'`) and logs `escalated` event in `request_history`. Links `requests.current_escalation_id` to the active escalation.
+  - Highest-tier protection: Rejects escalation attempts when a request is already at the highest authority level for its department with `400 Bad Request` (`check_violation`).
+  - Repeated escalation: Allows subsequent escalations after senior staff claim the request, up until the highest authority tier.
+- **Database Refinements & Procedural Functions (`database/migrations/V003__return_and_escalation.sql`):**
+  - Added PostgreSQL procedural function `return_request_to_queue(p_request_id, p_staff_user_id, p_reason)`.
+  - Added soft-deletion guard (`deleted_at IS NOT NULL`) to `escalate_request_to_queue`.
+  - Refined `claim_request()` escalation handling to explicitly verify active queued status (`status = 'queued'`) before setting source to `escalation_claim`, ensuring requests returned to queue after escalation and reclaimed default cleanly to `claim`.
+  - Synchronized greenfield master schema in `database/schema/14_functions.sql` and validation suite in `tests/schema_validation_test.sql` (15 tests passing).
+
+### 2. Architectural Decisions & Boundaries
+
+1. **Authoritative Procedural Logic:**
+   - Both return-to-queue and escalation are implemented directly in PostgreSQL procedures (`return_request_to_queue` and `escalate_request_to_queue`), providing transactional atomicity and preventing business logic duplication between backend and database layers.
+2. **Deterministic Row Locking:**
+   - Row-level `FOR UPDATE` locks on `requests` prevent concurrent state corruption between simultaneous claim, return, and escalation requests.
+3. **Capacity Release Guarantee:**
+   - Terminating active assignments via `ended_at = NOW()` immediately decrements active workload counts evaluated by both queue CTEs and claim capacity constraints (`active_count < effective_capacity`).
+4. **Clean Domain History Attribution:**
+   - Domain actions (`returned_to_queue`, `escalated`, `claimed`) are explicitly recorded with contextual metadata (reasons, levels, sequences) without duplicate history entries inserted by application code.
+
+### 3. Files Created & Modified
+
+#### Created
+- `database/migrations/V003__return_and_escalation.sql`: Migration script adding `return_request_to_queue`, soft-delete guards, and active escalation status checks.
+- `tests/integration/staffReturnEscalate.concurrent.test.ts`: PostgreSQL concurrency tests for return, escalation, and higher-tier claiming workflows.
+
+#### Modified
+- `database/schema/14_functions.sql`: Added `return_request_to_queue` and updated `escalate_request_to_queue` and `claim_request` for greenfield deployments.
+- `src/validators/requestWorkflow.validators.ts`: Added strict Zod schemas for `returnRequestSchema` and `escalateRequestSchema`.
+- `src/repositories/requestWorkflow.repository.ts`: Added transactional `returnRequest` and `escalateRequest` repository methods.
+- `src/services/staff/staffWorkflow.service.ts`: Added `returnRequest` and `escalateRequest` methods with error mappings for check violations and access controls.
+- `src/controllers/staffWorkflow.controller.ts`: Added Express handlers for `returnRequest` and `escalateRequest`.
+- `src/routes/v1/staffQueue.router.ts`: Mounted `POST /requests/:requestId/return` and `POST /requests/:requestId/escalate`.
+- `tests/unit/staffWorkflow.test.ts`: Added 18 unit tests (tests 16–33) covering return, escalation, role guards, invalid statuses, highest-tier rejection, and repository transactions.
+- `tests/schema_validation_test.sql`: Added Tests 13–15 validating return, assignment termination, reason constraints, and reclaimability at the SQL level.
+- `PROGRESS.md`: Documented Milestone 1 progress and architectural decisions.
+- `README.md`: Documented return and escalation endpoints.
+
+### 4. Tests Performed & Results
+
+- **Vitest Unit Test Suite:**
+  - 17 test files, 157 unit tests, **100% passing**.
+- **TypeScript Typecheck:**
+  - `tsc --noEmit` passed with 0 errors.
+- **Production Build:**
+  - `npm run build` compiled successfully to `dist/`.
+
+---
+
+## Phase 6: Request Workflow & Student Reopening (Completed)
+
+### 1. Implemented Features
+
+- **Start Processing (`PATCH /api/v1/staff/requests/:requestId/start`):**
+  - Allows the currently assigned staff member to transition a claimed request from `assigned` to `in_progress`.
+  - Strict authorization: Only the assigned handler can start processing; other staff members are rejected with `403 Forbidden`.
+  - Validates operational status: Requests in `pending`, `in_progress`, `resolved`, `closed`, or `rejected` are rejected with `400 Bad Request`.
+  - Preserves assignment intervals and atomic audit history.
+- **Atomic Request Resolution (`POST /api/v1/staff/requests/:requestId/resolve`):**
+  - Staff resolution requires mandatory resolution classification (`resolutionCategory`) and a non-empty resolution message (`resolutionMessage` / `resolution_notes`).
+  - Allowed resolution classifications: `'resolved_fully'`, `'workaround_provided'`, `'information_provided'`, `'referred_to_external'`, `'other'`.
+  - Atomic two-step transition: Transitions `in_progress` → `resolved`, and immediately automatically to `closed` within a single database transaction.
+  - Releases staff capacity: Ends the active assignment in `request_assignments` (`ended_at = NOW()`), decreasing staff active workload count.
+  - Immutably anchors reopening time window: Sets `first_closed_at = COALESCE(first_closed_at, NOW())` on first closure, guaranteeing subsequent reopenings never reset the reopening window.
+  - Preserves separate lifecycle events in `request_history` via database trigger `trg_requests_lifecycle_history` with full contextual details.
+- **Request Rejection (`POST /api/v1/staff/requests/:requestId/reject`):**
+  - Staff can reject requests in either `assigned` or `in_progress` status.
+  - Mandatory non-empty rejection reason stored on the request (`rejection_reason`) and recorded in history.
+  - Releases staff capacity: Ends the active assignment in `request_assignments` (`ended_at = NOW()`).
+  - Transitions status to `rejected` and records `rejected_at = NOW()`.
+  - Rejection is final: Rejection cannot be challenged or reopened by students.
+- **Student Reopening (`POST /api/v1/requests/:requestId/reopen`):**
+  - Allows owning students to reopen closed requests back to `pending` queue without administrative approval.
+  - Student ownership guard: Students can only reopen requests they submitted; other students receive generic `404 Not Found` without information leakage.
+  - Database-backed global configuration: Reopening time window (default 7 days) and maximum reopening count (default 2, allowed 1–5) are enforced on the backend.
+  - Window immutability: Reopening window evaluates strictly against the immutable `first_closed_at` timestamp and is never reset by reopenings.
+  - Authority queue preservation: The reopened request retains its existing `current_authority_level_id` (does not reset to the category's initial queue).
+  - Previous assignment remains in history as inactive (`ended_at` remains set); request assignment pointer resets to `NULL` to enter the department queue. Previous staff handler remains eligible to reclaim if normal eligibility criteria are met.
+- **Enhanced Student Request Tracking (`GET /api/v1/requests/:requestId`):**
+  - Exposes public reference, request title, description, status, priority, department, and category.
+  - Displays assigned or handling staff member (public name and university email only).
+  - Surfaces resolution outcome (category and message) and rejection reason.
+  - Dynamic reopening availability: Returns `isAllowed`, `remainingReopenings`, `maxReopenCount`, `windowExpiresAt`, and `remainingWindowSeconds`.
+  - Student-safe timeline history: Chronological list of lifecycle transitions with actor attribution and event reasons; strictly redacts internal admin metadata and IDs.
+- **Database-Backed Workflow Settings Administration (`/api/v1/admin/settings/request-workflow`):**
+  - Dedicated `system_settings` table stores dynamic global platform settings.
+  - `GET /api/v1/admin/settings/request-workflow`: Allows administrators to inspect current configuration.
+  - `PATCH /api/v1/admin/settings/request-workflow`: Allows administrators to configure `reopenWindowDays` (>= 1) and `maxReopenCount` (1–5).
+
+### 2. Architectural Decisions & Boundaries
+
+1. **Zero History Duplication with Contextual Triggers:**
+   - Rather than manually inserting status history rows in TypeScript, the PostgreSQL trigger `trg_requests_lifecycle_history` (`record_request_lifecycle_change()`) was enhanced to log rich structured context (`source`, `resolution_category`, `resolution_notes`, `rejection_reason`, `reopen_reason`, `reopen_count`) directly within each database transition.
+2. **Deterministic Row Locking:**
+   - All state mutations (`start`, `resolve`, `reject`, `reopen`) acquire `FOR UPDATE` row locks on `requests`, serializing concurrent workflows and preventing double-reopens, invalid status bypasses, or race conditions.
+3. **Immutable Closure Anchor for Reopening Window:**
+   - `first_closed_at` is set via `COALESCE(first_closed_at, NOW())` upon first closure and is never overwritten. All reopening eligibility calculations strictly evaluate against this immutable deadline.
+4. **Information Leakage & Data Privacy:**
+   - Single request detail and reopening endpoints return generic `404 Not Found` when accessed by another student, preventing ID enumeration. Student tracking timelines only expose student-safe information.
+
+### 3. Files Created & Modified
+
+#### Created
+- `database/migrations/V002__request_workflow.sql`: Migration script adding workflow columns, constraints, system settings, and enriched lifecycle history triggers.
+- `database/schema/18_system_settings.sql`: Greenfield master schema for global system settings.
+- `src/validators/requestWorkflow.validators.ts`: Zod schemas for resolve, reject, and reopen inputs.
+- `src/validators/systemSettings.validators.ts`: Zod schemas for administrative workflow settings.
+- `src/repositories/requestWorkflow.repository.ts`: Data access layer for row-locked start, resolve, reject, and reopen transactions.
+- `src/repositories/systemSettings.repository.ts`: Repository for database-backed workflow configuration.
+- `src/services/staff/staffWorkflow.service.ts`: Staff workflow business logic.
+- `src/services/admin/systemSettings.service.ts`: Admin settings service.
+- `src/controllers/staffWorkflow.controller.ts`: Express controller for staff workflow actions.
+- `src/controllers/systemSettings.controller.ts`: Express controller for admin settings.
+- `src/routes/v1/systemSettings.router.ts`: Router mounted at `/api/v1/admin/settings`.
+- `tests/unit/systemSettings.test.ts`: 7 unit tests covering settings retrieval, updates, boundary validations, and role protection.
+- `tests/unit/staffWorkflow.test.ts`: 15 unit tests covering start, resolve, reject, assignments, and authorization.
+- `tests/unit/requestReopenTracking.test.ts`: 10 unit tests covering student reopening limits, windows, tracking, and ownership.
+- `tests/integration/requestWorkflow.concurrent.test.ts`: Real PostgreSQL concurrency test for concurrent reopening attempts.
+
+#### Modified
+- `database/schema/06_requests.sql`: Added `resolution_category`, `rejection_reason`, `first_closed_at`, `last_reopen_reason`, and check constraints.
+- `database/schema/14_functions.sql`: Enhanced `record_request_lifecycle_change()` with contextual event logging.
+- `database/univoice_schema.sql`: Included `18_system_settings.sql`.
+- `src/repositories/request.repository.ts`: Added workflow columns, student tracking queries, and history retrieval.
+- `src/services/student/request.service.ts`: Added `reopenRequest` and enhanced `getRequestDetails`.
+- `src/controllers/request.controller.ts`: Added `reopenRequest` handler.
+- `src/routes/v1/staffQueue.router.ts`: Mounted `/requests/:requestId/start`, `/resolve`, `/reject`.
+- `src/routes/v1/request.router.ts`: Mounted `/requests/:requestId/reopen`.
+- `src/routes/v1/index.ts`: Mounted `/admin/settings` route.
+- `PROGRESS.md`: Documented Phase 6 milestones and architectural decisions.
+- `README.md`: Documented Phase 6 endpoints and request workflow lifecycle.
+
+### 4. Tests Performed & Results
+
+- **Vitest Unit Test Suite:**
+  - 17 test files, 139 tests, **100% passing**.
+- **TypeScript Typecheck:**
+  - `tsc --noEmit` passed with 0 errors.
+- **Production Build:**
+  - `npm run build` compiled successfully to `dist/`.
 
 ---
 
