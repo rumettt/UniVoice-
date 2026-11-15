@@ -21,7 +21,8 @@ CREATE TABLE request_assignments (
       'initial',
       'reassignment',
       'system_assigned',
-      'reopen'
+      'reopen',
+      'transfer'
     )),
   CONSTRAINT request_assignments_range
     CHECK (ended_at IS NULL OR ended_at >= started_at)

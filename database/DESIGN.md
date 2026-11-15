@@ -115,3 +115,36 @@ requests 1──* notifications
 2. **Final-Level Escalation Policy**: Raise exception. Requests at the department's highest authority tier cannot be escalated further; senior staff must resolve, reject, or handle them.
 3. **Multi-Department Positions**: Department-scoped. Staff can hold positions in multiple departments, with uniqueness enforced per `(staff_user_id, department_id)`.
 4. **File Organization**: Strict file partitioning. Schema files 09–12 have each table aligned to its eponymous SQL file.
+
+---
+
+## 6. Milestone 4 Assistance Database Foundation (Stage 2)
+
+The greenfield schema now includes `schema/07_assistance.sql`, the assistance notification link,
+append-only history/assignment/message protections, and assistance indexes. Existing-database
+upgrades use forward migration V006 after V005; V005 is not rewritten. This repository does not
+track migration application state, and the configured development database could not be queried,
+so neither V005 nor V006 is reported as applied.
+
+`department_category_compatibilities` maps an immutable parent-origin category to a supporting
+department/category. Tasks snapshot the parent origin, creating handler/assignment, and original
+supporting route, while current supporting route fields can change through a later transfer. Composite
+foreign keys enforce request-origin, department/category, department/authority, assignment/task,
+message/task, and attachment/message/task consistency. History, assignment, transfer, reopen,
+message, and attachment records use restrictive references and mutation-prevention triggers where
+appropriate. Tasks are soft-deleted only while pending and never claimed; task rows cannot be
+physically deleted.
+
+`assert_staff_assignment_capacity()` locks the staff/department work-settings row, rejects a missing
+row or unavailable staff member, and counts active request plus assistance assignments against the
+existing override/default capacity. The database `claim_request()` function calls this helper.
+Assistance claiming and the staff queue preview have not yet been updated; therefore the unified
+capacity invariant is a foundation, not a completed end-to-end guarantee. No assistance claim API is
+enabled by this schema stage.
+
+Parent-resolution query prerequisite for the next stage (not yet implemented): consider only tasks for
+the locked parent where `deleted_at IS NULL`. Block resolution when status is `assigned`,
+`in_progress`, `completed`, or `rejected`; when status is `pending` and `ever_claimed_at IS NOT NULL`;
+or when a pending assistance transfer exists. Only undeleted `pending` tasks with
+`ever_claimed_at IS NULL` are auto-cancel candidates. Closed, cancelled, and soft-deleted tasks do
+not block and are not rewritten.

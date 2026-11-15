@@ -317,6 +317,43 @@ Returns API availability and database connectivity status.
 
 ---
 
+### Permanent Transfers (`/api/v1/staff/transfers`, `/api/v1/admin/transfers`)
+
+Permanently transfers ownership of a student request from one department to another.
+
+- `POST /api/v1/staff/requests/:requestId/transfers`: Initiate a permanent transfer *(Middle/apex staff or admin only)*.
+  - Lowest-authority staff cannot initiate transfers (`403 Forbidden`).
+  - Three-tier authority ceiling: middle-tier initiators cannot target the receiving department's apex authority level; apex initiators and administrators can target any active receiving level.
+  - Receiving department must be active and different from the current responsible department.
+  - Receiving category must belong to the receiving department and be active.
+  - Receiving authority level must belong to the receiving department and be active.
+  - Requires a non-empty mandatory `reason`.
+  - At most one pending transfer per request at a time (`409 Conflict` if one already exists).
+  - Transfer records are never deleted; cancellations retain full history.
+  - If the request is returned, escalated, resolved, closed, or rejected while the transfer is pending, the pending transfer is automatically cancelled atomically by a database trigger.
+- `GET /api/v1/staff/requests/:requestId/transfers`: List all transfer records for a request *(Staff in current/past handling department, or admin)*.
+- `GET /api/v1/staff/transfers/pending`: List pending transfers targeting the authenticated staff member's department *(Staff or admin)*.
+- `POST /api/v1/staff/transfers/:transferId/accept`: Accept a pending transfer *(Receiving department staff only — administrators cannot accept on behalf of receiving staff)*.
+  - Caller must hold active membership, authority level ≥ target level, and category authorization in the receiving department.
+  - Atomically: ends original handler's assignment (releases capacity), updates request ownership (department, category, authority level, `status → pending`), marks transfer `accepted`, and records history.
+  - `initial_category_id` is never altered — the student's original classification is immutably preserved.
+- `POST /api/v1/staff/transfers/:transferId/reject`: Reject a pending transfer *(Receiving department staff only)*.
+  - Mandatory non-empty `rejectionReason` required.
+  - Original department retains ownership; original handler remains assigned; no capacity is released.
+  - Transfer recorded as `rejected` with reason preserved.
+- `GET /api/v1/admin/transfers`: Monitor transfers across all departments *(Admin only)*.
+
+### Milestone 4 Database Foundation (Stage 2)
+
+The database schema includes the assistance compatibility, task, assignment, history, transfer,
+reopening, message, read-state, and attachment structures. V006 is a forward migration that requires
+V005; inspect the target database before applying it because this repository has no migration ledger.
+The SQL capacity helper is used by parent request claiming and counts both assignment tables, but
+assistance claiming, queue preview integration, and assistance APIs are not implemented yet.
+See [`database/README.md`](database/README.md) for schema and migration ordering.
+
+---
+
 ### Workflow Configuration Settings (`/api/v1/admin/settings`)
 
 - `GET /api/v1/admin/settings/request-workflow`: View current global workflow settings *(Admin only)*.

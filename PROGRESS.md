@@ -1,6 +1,6 @@
 # UniVoice — Implementation Progress
 
-This document tracks project implementation milestones, completed phases, key architectural decisions, and current status.
+This document tracks project implementation milestones, completed phases, key architectural decisions, outstanding technical verification, and current status. It serves as the primary technical reference and handoff guide.
 
 ---
 
@@ -14,31 +14,229 @@ This document tracks project implementation milestones, completed phases, key ar
 | **Phase 4** | Request Submission & Student Workflow | ✅ Completed | 2026-11-09 |
 | **Phase 5** | Staff Queues, Escalation & Approvals | ✅ Completed | 2026-11-09 |
 | **Phase 6** | Request Workflow & Student Reopening | ✅ Completed | 2026-11-12 |
-| **Phase 7** | Escalation & Reassignment | 🟡 In Progress (Milestones 1 & 2 Completed) | — |
+| **Phase 7, M1** | Request Return and Escalation | ✅ Completed | 2026-11-13 |
+| **Phase 7, M2** | Closed-Request Communication & Messaging | ✅ Completed | 2026-11-14 |
+| **Phase 7, M3** | Permanent Transfers | ✅ Completed | 2026-11-14 |
+| **Phase 7, M4** | Interdepartmental Assistance | 🚧 Stage 2 database foundation implemented in workspace; not applied to a database | — |
+
+---
+
+## Verification Snapshot (Audit: 2026-11-14)
+
+- **TypeScript Typecheck (`npm run typecheck`)**: Passed with 0 errors (`tsc --noEmit`).
+- **Production Build (`npm run build`)**: Success (compiled to `dist/` without errors).
+- **Vitest Unit Test Suite (`npm test`)**:
+  - **19 test files passed**, 0 failed.
+  - **187 unit tests passed**, 0 failed.
+- **PostgreSQL Integration Tests (Concurrency Suite)**:
+  - 3 test files, 4 tests skipped:
+    - `tests/integration/requestWorkflow.concurrent.test.ts` (1 test skipped)
+    - `tests/integration/staffQueue.concurrent.test.ts` (1 test skipped)
+    - `tests/integration/staffReturnEscalate.concurrent.test.ts` (2 tests skipped)
+  - **Reason**: Skipped because `TEST_DATABASE_URL` was not configured in the test environment.
+  - **Status**: Live PostgreSQL concurrency, row-level locking, and transactional procedures remain **unverified against a real database instance**. Mocked unit tests verify application routing, error mapping, and service logic only; they do not establish database-level concurrency safety.
+
+### Milestone 4 Stage 2 implementation status (2026-11-14)
+
+- Assistance schema modules and forward migration V006 are present in the workspace.
+- V006 requires a complete V005 state and does not modify V005. The target database could not be queried because the configured database password was unavailable; V005 and V006 application status are therefore **unverified**.
+- `assert_staff_assignment_capacity()` locks the existing work-settings row and counts active request plus assistance assignments. `claim_request()` uses this helper.
+- The next-stage parent-resolution guard must include undeleted `pending` tasks with `ever_claimed_at IS NOT NULL`; only undeleted pending tasks with no prior claim are auto-cancelled.
+- Assistance claiming and queue-preview integration are not implemented. Unified capacity is not yet an end-to-end guarantee; no assistance claim API is enabled.
+- `tests/schema_assistance_validation.sql` was added but could not be executed because `psql` and a working PostgreSQL connection are unavailable. SQL constraints are not reported as database-verified.
+- The approved business decisions and this implementation status supersede earlier M4 planning text and unresolved-decision notes below.
+
+---
+
+## Phase 7: Escalation & Reassignment — Milestone 4: Interdepartmental Assistance (Planning Specification)
+
+> **IMPLEMENTATION STATUS: Stage 2 schema and request-capacity SQL are implemented in the workspace; migration and database verification are pending. Earlier planning notes below are historical and superseded by the approved final implementation specification.**
+
+### 1. Agreed Business Rules
+
+#### A. Ownership, Accountability & Task Creation
+- **Original Accountability**: The original student request retains its `responsible_department_id`. The original handler remains assigned, accountable, and continues consuming staff capacity in the originating department.
+- **Multiple Simultaneous Tasks**: One parent request can have multiple assistance tasks across different supporting departments at the same time. Supporting staff cannot create chained assistance tasks.
+- **Task Creation Parameters**: The original handler creates assistance tasks by selecting:
+  - Supporting department.
+  - Authority level within that department.
+  - Supporting category (must be configured as compatible with parent request).
+  - Task title.
+  - Task description.
+  - Reason for requesting assistance.
+  - Priority (independent of the parent request's priority).
+- **Queue Preservation**: Tasks enter the selected authority queue. If no staff member is immediately available, the task remains in that queue; there is **no automatic authority downgrade**.
+
+#### B. Supporting Staff Workflow
+- Supporting staff manually discover and claim eligible tasks from their department's queue under the Threshold Rule (`staff_level >= target_level`).
+- Claiming consumes staff workload capacity in the supporting department.
+- Supporting staff can:
+  - Start processing an assigned task (`assigned -> in_progress`).
+  - Return an assigned or in-progress task to its same authority queue with a mandatory reason. Returning ends the active assignment and releases capacity.
+  - Complete the task by submitting a mandatory outcome message describing the work performed. **Completion submits the task for review; it does not close the task.** Completion ends the active assignment and releases capacity.
+  - Reject the task with a mandatory reason. Rejection ends the active assignment, releases capacity, and sends the task back to the original handler. **The original handler receives the rejection and decides what happens next; rejection does not automatically close or cancel the task.**
+
+#### C. Original Handler Review & Lifecycle Finalization
+- **Acceptance & Closure**: The original handler reviews completed work and can officially accept and close the task with a **mandatory closing message**. Sets `closed_at`.
+- **Corrections Cycle**: The original handler can return a completed task for corrections with a **mandatory reason**.
+  - Corrections can repeat indefinitely (`correction_count` increments).
+  - The task returns to the same supporting authority-level queue as `pending`.
+  - Eligible supporting staff (including previous handlers) may claim it again.
+  - All previous assignments, messages, attachments, and history remain preserved.
+- **Cancellation**: The original handler can cancel an assistance task with a mandatory reason. Cancellation ends any active supporting assignment and releases capacity.
+- **Soft Deletion vs Cancellation**:
+  - An assistance task can be soft-deleted (`deleted_at = NOW()`) **only if it has never been claimed** (`ever_claimed_at IS NULL`), accompanied by a mandatory audit record.
+  - Once a task has been claimed, it can **never be deleted**; it may only be cancelled.
+  - Tasks cannot be edited after creation. If unclaimed, the original handler may delete and recreate it.
+
+#### D. Reopening Closed Assistance Tasks
+- **Eligibility & Window**: Previous supporting handlers may request reopening within a configurable **three-week window** (21 days default) after closure.
+- **Mandatory Explanation**: The reopening request requires a non-empty explanation.
+- **Decision Authority**: The original request handler reviews the request and decides to approve or decline.
+- **Declining**: Declining leaves the task `closed` and requires a **mandatory recorded decline reason**.
+- **Approval**: Approval re-queues the task in `pending` status at its **original authority level**, not directly to the previous handler. It enters the queue for eligible supporting staff to claim.
+- **Limits**: Multiple reopening requests are permitted within the 21-day window, but **at most one reopening request may be pending at any time**. There is no arbitrary maximum lifetime reopen count.
+
+#### E. Administrative Capabilities & Boundaries
+- Administrators can:
+  - View and audit all assistance tasks across all departments.
+  - Force-cancel any assistance task regardless of status with a mandatory reason.
+  - Reassign an assigned/in-progress task to an eligible supporting staff member (verifying membership, authority, and capacity).
+  - Inspect all task conversations and attachments for audit purposes.
+  - Initiate supporting-department transfers (redirecting the task to another department), subject to receiving staff acceptance or rejection.
+  - Monitor workloads, delays, response times, completion times, and rejection rates.
+- **Boundary**: Administrative task closure and correction requests are **not granted** by default (marked as an unresolved decision below).
+
+#### F. Messaging & Attachment Privacy
+- **Private Two-Way Conversation**: Private messaging is provided strictly between the current original handler and current supporting handler.
+- **Attachments & Read Tracking**: File attachments are supported (with magic-byte validation). Read state and unread counts are tracked per-user.
+- **Persistence Across Assignment Cycles**: Complete conversation history persists across returns, correction cycles, reassignments, and department transfers.
+- **Historical Access**: Authorized past handlers access conversation history based on verified assignment records. Administrators have read-only audit access.
+- **Student Privacy**:
+  - Students cannot access internal assistance conversations, task descriptions, reasons, notes, or staff identities.
+  - Students see only whether assistance is currently in progress and the supporting department's name.
+  - When assistance is rejected or cancelled, students see only a generic "assistance ended" state, without internal reasons or outcome details.
+
+#### G. Notifications & Monitoring
+- **Event-Driven In-App Alerts**: Notifications are generated in the same transaction as the workflow event and sent **only to relevant eligible users** (verifying active account, active membership, authority threshold, category authorization, and availability).
+- **Admin Exclusion**: Administrators do not receive ordinary event notifications; they use the administrative dashboard.
+- **Performance Reporting Metrics**: The admin dashboard tracks response time, completion time, rejection rate, workload distribution, and overdue delays.
+
+---
+
+### 2. Proposed Technical Design (Awaiting Implementation Review)
+
+#### A. Database Schema Additions (Migration `V006`)
+1. **`department_category_compatibilities`**: Defines compatible category mappings between originating categories (`requests.initial_category_id`) and supporting department categories.
+2. **`request_assistance_tasks`**: Primary entity storing `ever_claimed_at`, `due_at`, `correction_count`, `reopen_count`, and `deleted_at`.
+3. **`request_assistance_assignments`**: Supporting staff handling intervals, enforcing `UNIQUE (assistance_task_id) WHERE ended_at IS NULL`.
+4. **`request_assistance_history`**: Dedicated append-only audit table protected by `prevent_mutation()`, referencing `(assistance_task_id, request_id)` with `ON DELETE RESTRICT`.
+5. **`request_assistance_department_transfers`**: Admin-initiated supporting department transfer with acceptance/rejection by receiving staff.
+6. **`request_assistance_reopen_requests`**: Reopen requests from past handlers within the 21-day window. Enforces at most one pending request per task.
+7. **`request_assistance_messages` & `request_assistance_message_reads`**: Two-way messaging with per-user read tracking.
+8. **`request_assistance_attachments`**: Attachment metadata linked to tasks and messages via composite foreign key `(message_id, assistance_task_id)`.
+9. **`notifications.assistance_task_id`**: Nullable foreign key addition.
+
+#### B. Parent Request Lifecycle Synchronization Trigger (`trg_requests_assistance_lifecycle_sync`)
+- Attached `BEFORE UPDATE OF status, responsible_department_id ON requests`.
+- **Resolution Guard**: Blocks parent request resolution (`in_progress -> resolved`) if active assistance tasks exist (`assigned`, `in_progress`, `completed`, `transfer_pending`). **Preserves completed work awaiting review without accidental cancellation.**
+- **Unclaimed Task Cancellation**: Cancels pending, never-claimed assistance tasks atomically upon parent request resolution.
+- **Disruption Cascading**: On parent return, escalation, transfer, or rejection, atomically cancels all in-flight assistance tasks, cancels pending department transfers and reopen requests, and ends active assignments to release supporting capacity.
+
+#### C. Global Lock Sequence
+$$\text{Parent Request} \;\longrightarrow\; \text{Assistance Task} \;\longrightarrow\; \text{Staff Work Settings (Capacity)}$$
+
+---
+
+### 3. Unresolved Decisions Requiring Explicit Approval
+
+1. **Single-Level Department Policy**: Proposed that in a department where $\text{min\_order} = \text{max\_order}$, the sole level is treated as the lowest tier (staff cannot initiate assistance tasks without administrative assistance). Awaiting explicit approval.
+2. **Administrative Closure & Correction Permissions**: The agreed rule assigns task closure and requesting corrections strictly to the original request handler. Whether administrators should be granted override permissions to accept/close or request corrections on assistance tasks remains an open decision.
+3. **Priority Deadline Durations**: Initial default hours for `urgent`, `high`, `medium`, and `low` assistance tasks are not hardcoded. Initial values must be explicitly decided for deployment configuration in `system_settings`.
+
+---
+
+## Outstanding Technical Risks and Verification
+
+The following technical items require rigorous verification during Milestone 4 implementation and must not be assumed resolved:
+
+1. **Unified Capacity Enforcement in Existing Code**:
+   - `claim_request` in `database/schema/14_functions.sql` currently counts only `request_assignments`. It must be updated in migration `V006` to include `request_assistance_assignments`.
+   - The queue eligibility CTE in `src/repositories/staffQueue.repository.ts` must be verified to incorporate the unified count.
+2. **Shared Work-Settings Row Locking & Provisioning Invariant**:
+   - Both claim operations must lock `staff_department_work_settings` row `FOR UPDATE` before reading active workloads.
+   - If a work-settings row is unexpectedly missing, the claim procedure must abort with an error rather than silently provisioning availability defaults.
+3. **Parent Request Lifecycle Synchronization**:
+   - The proposed trigger `trg_requests_assistance_lifecycle_sync` must be tested to ensure the `resolved -> closed` transition in `resolveRequest` does not cause duplicate checks, recursive trigger loops, or conflicting updates.
+4. **Referential Integrity for Assistance History**:
+   - `request_assistance_history` must enforce composite foreign keys `(assistance_task_id, request_id)` to guarantee a task's history cannot be associated with the wrong parent request.
+   - All history references must use `ON DELETE RESTRICT`.
+5. **Department Transfer Rejection Safety**:
+   - On transfer rejection, if the prior handler has become unavailable, inactive, or unauthorized, the task must safely return to the supporting queue rather than restoring an invalid active assignment.
+6. **Notification Delivery & Inactive User Guards**:
+   - Ordinary event notifications must strictly exclude administrators and filter out inactive or unavailable staff.
+7. **Lock Ordering Verification**:
+   - All multi-resource operations must follow `Parent Request -> Assistance Task -> Staff Work Settings` to eliminate deadlocks.
+8. **Real PostgreSQL Concurrency & Migration Testing**:
+   - All concurrency guarantees (competing claims, cancellation races, capacity limits) must be verified against an actual running PostgreSQL instance using `TEST_DATABASE_URL`.
+
+---
+
+## Phase 7: Escalation & Reassignment — Milestone 3: Permanent Transfers (Completed)
+
+### 1. Implemented Features
+- **Transfer Initiation (`POST /api/v1/staff/requests/:requestId/transfers`)**:
+  - Initiated by middle- or highest-authority staff, or administrators. Lowest-tier staff receive `403 Forbidden`.
+  - Three-tier authority ceiling: Middle-tier initiators cannot target the receiving department's apex authority level (`400 Bad Request`). Apex and administrators can target any active receiving level.
+  - Receiving department must be active and distinct from current department.
+  - At most one pending transfer per request (`409 Conflict`).
+- **Transfer Acceptance (`POST /api/v1/staff/transfers/:transferId/accept`)**:
+  - Receiving department staff with active membership, authority level $\ge$ target level, and category authorization can accept incoming transfers.
+  - Administrators cannot directly accept on behalf of receiving staff (`403 Forbidden`).
+  - Atomically terminates the original handler's assignment (releasing capacity), updates request ownership (`responsible_department_id`, `category_id`, `current_authority_level_id`, `status = 'pending'`, `current_assignment_id = NULL`), marks transfer `accepted`, and records history.
+- **Transfer Rejection (`POST /api/v1/staff/transfers/:transferId/reject`)**:
+  - Receiving staff can reject with a mandatory `rejectionReason`.
+  - Original department retains ownership; handler assignment and capacity remain occupied.
+- **Admin Transfer Monitoring (`GET /api/v1/admin/transfers`)**:
+  - Cross-department visibility into pending transfers.
+- **Original Category Immutability**:
+  - `requests.initial_category_id` stores the student's original category permanently, protected by trigger `trg_requests_protect_initial_category`.
+- **Pending Transfer Invalidation**:
+  - Trigger `trg_requests_invalidate_pending_transfer` auto-cancels pending transfers if the parent request is returned, escalated, resolved, closed, or rejected.
+
+### 2. Files Added & Modified in Milestone 3
+- `database/migrations/V005__permanent_transfers.sql`
+- `src/validators/transfer.validators.ts`
+- `src/repositories/transfer.repository.ts`
+- `src/services/staff/transfer.service.ts`
+- `src/controllers/transfer.controller.ts`
+- `src/routes/v1/transfer.router.ts`
+- `src/repositories/request.repository.ts`
+- `src/routes/v1/index.ts`
+- `tests/unit/transfer.test.ts` (12 unit tests, 100% passing)
 
 ---
 
 ## Phase 7: Escalation & Reassignment — Milestone 2: Closed-Request Communication and Messaging (Completed)
 
 ### 1. Implemented Features
-
-- **Student Messaging on Closed Requests (`POST /api/v1/requests/:requestId/messages`):**
+- **Student Messaging on Closed Requests (`POST /api/v1/requests/:requestId/messages`)**:
   - Allows students to post follow-up messages on their own `closed` requests.
   - Sending a message does **NOT** alter the request status (it remains `closed`).
   - Strict privacy and anti-enumeration: Request must exist, be closed, and belong to the authenticated student (`404 Not Found` for other students).
   - Messages are saved to `comments` with `visibility = 'student_visible'`.
-- **Student Conversation Retrieval (`GET /api/v1/requests/:requestId/messages`):**
+- **Student Conversation Retrieval (`GET /api/v1/requests/:requestId/messages`)**:
   - Allows students to fetch student-visible messages on their closed requests, with pagination (`page`, `limit`).
-- **Staff Conversation Retrieval (`GET /api/v1/staff/requests/:requestId/messages`):**
+- **Staff Conversation Retrieval (`GET /api/v1/staff/requests/:requestId/messages`)**:
   - Allows the last assigned staff handler to inspect the closed request's conversation.
   - Non-handlers receive `403 Forbidden`.
-- **Staff Reply (`POST /api/v1/staff/requests/:requestId/messages`):**
+- **Staff Reply (`POST /api/v1/staff/requests/:requestId/messages`)**:
   - Last handler staff can send a response to the student, preserving conversation history and keeping status `closed`.
-- **Staff Reopening (`POST /api/v1/staff/requests/:requestId/reopen-closed`):**
+- **Staff Reopening (`POST /api/v1/staff/requests/:requestId/reopen-closed`)**:
   - Replaces student-facing direct reopening. Last handler staff can reopen an eligible closed request with a mandatory non-empty reason.
   - Enforces system settings (`maxReopenCount`, `reopenWindowDays`) and increments `reopen_count`.
   - Re-queues the request in `pending` status at the preserved authority level with `current_assignment_id = NULL`.
-- **Staff Rejection of Further Action (`POST /api/v1/staff/requests/:requestId/reject-further`):**
+- **Staff Rejection of Further Action (`POST /api/v1/staff/requests/:requestId/reject-further`)**:
   - Last handler staff can permanently deny further action with an explanation visible to the student (`comments` table) and logged in `request_history` (`action = 'further_action_rejected'`).
   - Request remains `closed`.
 - **Deprecation of Student Reopen Endpoint (`POST /api/v1/requests/:requestId/reopen`):**
@@ -51,12 +249,10 @@ This document tracks project implementation milestones, completed phases, key ar
   - Secure authorized download (`GET /api/v1/attachments/:attachmentId`) with access checks for student owners, staff handlers, and admins.
 
 ### 2. Database & Performance Refinements
-
 - Database migration `database/migrations/V004__messaging.sql` adds covering index `idx_comments_request_visible_paginate` on `comments(request_id, created_at ASC) WHERE deleted_at IS NULL AND visibility = 'student_visible'`.
 - Greenfield schema `16_indexes.sql` updated to include the performance index.
 
 ### 3. Focused Verification & Hardening Results
-
 - **A. Last-Handler Identification**: Hardened `getLastHandler` in `messaging.repository.ts` to sort by `(ended_at IS NULL) DESC, COALESCE(ended_at, started_at) DESC, started_at DESC`, guaranteeing the staff member who actually brought the request to resolution/closure is selected rather than an earlier returned assignee whose started_at might be ambiguous in rapid reassignment cycles.
 - **B. Unavailable Last Handler**: Verified that student messages remain associated with the last handler, do not enter any general queue, and do not change request status (`closed` preserved).
 - **C. Attachment Security**:
@@ -64,11 +260,70 @@ This document tracks project implementation milestones, completed phases, key ar
   - Enforced strict authorization against request ownership and handler context for all downloads.
 - **D. Storage & Database Consistency**: Verified transactional isolation and rollback cleanup logic: if the metadata insertion fails, the uploaded storage file is immediately cleaned up via `storageAdapter.delete()`.
 - **E. Staff Reopening Policy Alignment**: Aligned `reopenRequestByStaff()` in `requestWorkflow.repository.ts` with student reopening rules, adding an explicit check that rejects attempts to reopen `rejected` requests (`400 Bad Request`, `rejection_final`).
-- **Test Suite Status**: 18 test files, 175 unit tests passing (5 new verification tests added). Production build and typecheck passing with zero errors.
+- **Test Suite Status at Milestone 2 Completion**: 18 test files, 175 unit tests passing. Production build and typecheck passing with zero errors.
 
 ---
 
 ## Phase 7: Escalation & Reassignment — Milestone 1: Request Return and Escalation (Completed)
+
+### 1. Implemented Features
+- **Return to Queue (`POST /api/v1/staff/requests/:requestId/return`)**:
+  - Allows the currently assigned staff member to return an assigned or in-progress request back to its department queue.
+  - Strict ownership guard: Only the active handler may return the request; attempts by other staff members are rejected with `403 Forbidden`.
+  - Operational status validation: Requests in `pending`, `resolved`, `closed`, or `rejected` status cannot be returned and are rejected with `400 Bad Request`. Nonexistent or deleted requests return `404 Not Found`.
+  - Mandatory reason: Requires a non-empty, trimmed `reason` validated with Zod. Missing or whitespace-only reasons are rejected with `400 Bad Request`.
+  - Capacity release: Ends the active assignment in `request_assignments` (`ended_at = NOW()`), immediately reducing the staff member's active assignment count and restoring capacity.
+  - Queue restoration: Sets request `status = 'pending'` and resets `current_assignment_id = NULL`.
+  - Department and authority tier preservation: Responsible department and `current_authority_level_id` are strictly preserved without resetting to initial category queues.
+  - Immutable audit history: Records `returned_to_queue` action in `request_history` along with structured JSON details (`reason`, `department_id`, `authority_level_id`).
+  - Reclaim capability: The previous handler remains eligible to reclaim the request through standard queue claiming if another staff member has not claimed it first.
+- **Request Escalation (`POST /api/v1/staff/requests/:requestId/escalate`)**:
+  - Exposes the authoritative database procedure `escalate_request_to_queue(p_request_id, p_staff_user_id, p_reason, p_notes)`. Zero duplicate business logic in TypeScript.
+  - Strict ownership guard: Only the currently assigned handler can escalate the request (`403 Forbidden` for other staff members).
+  - Mandatory reason and optional notes: Requires non-empty `reason` and supports optional context notes.
+  - Monotonic authority queue advancement: Advances request exactly one authority tier higher within the same department (`level_order > current_level_order`).
+  - Capacity release: Ends active assignment (`ended_at = NOW()`) and sets `status = 'pending'` in the elevated queue with `current_assignment_id = NULL`.
+  - Escalation history: Inserts sequential record into `request_escalations` (`status = 'queued'`) and logs `escalated` event in `request_history`. Links `requests.current_escalation_id` to the active escalation.
+  - Highest-tier protection: Rejects escalation attempts when a request is already at the highest authority level for its department with `400 Bad Request` (`check_violation`).
+  - Repeated escalation: Allows subsequent escalations after senior staff claim the request, up until the highest authority tier.
+- **Database Refinements & Procedural Functions (`database/migrations/V003__return_and_escalation.sql`)**:
+  - Added PostgreSQL procedural function `return_request_to_queue(p_request_id, p_staff_user_id, p_reason)`.
+  - Added soft-deletion guard (`deleted_at IS NOT NULL`) to `escalate_request_to_queue`.
+  - Refined `claim_request()` escalation handling to explicitly verify active queued status (`status = 'queued'`) before setting source to `escalation_claim`.
+  - Synchronized greenfield master schema in `database/schema/14_functions.sql`.
+
+---
+
+## Phases 1–6 Architectural Summary
+
+- **Phase 1 (Backend Foundation)**: Express, TypeScript, pg pool, centralized error handling, Zod env validation, health routes.
+- **Phase 2 (Auth & RBAC)**: Argon2id, JWT access + hashed refresh tokens in PostgreSQL, atomic rotation, family replay detection.
+- **Phase 3 (Users & Departments)**: User provisioning transactions, department CRUD, effective-dated memberships and work settings.
+- **Phase 4 (Request Submission)**: Student request submission deriving initial department and authority queue directly from categories.
+- **Phase 5 (Staff Queues & Claiming)**: Database-authoritative `claim_request()` procedure with capacity and authority Threshold Rule checks.
+- **Phase 6 (Workflows & Reopening)**: In-progress transitions, atomic resolution, closure window, student reopening limits.
+
+---
+
+## Codex Handoff & Development Guidelines
+
+When continuing development on UniVoice, follow these strict working rules:
+
+1. **Read Documentation First**:
+   - Thoroughly read `PROGRESS.md`, `README.md`, `database/DESIGN.md`, and `database/README.md` before making changes.
+2. **Inspect Actual Code Before Modifying**:
+   - Inspect the actual TypeScript files in `src/` and SQL schemas in `database/schema/`. Do not assume documentation matches implementation.
+3. **Milestone 4 Is Approved and In Progress**:
+   - Follow the user's staged implementation instructions and approved final specification.
+   - Do not revive business decisions marked final in that specification.
+4. **Preserve Database-Authoritative Architecture**:
+   - UniVoice relies on PostgreSQL procedures and constraints for concurrency, capacity, and state transitions. Do not duplicate business logic in TypeScript that belongs in database transactions.
+5. **Enforce Unified Staff Capacity**:
+   - When implementing Milestone 4, verify that `claim_request` and `claim_assistance_task` serialize against the same `staff_department_work_settings` row and enforce the identical combined workload formula.
+6. **Work Incrementally**:
+   - Follow the sequence: Database migration $\rightarrow$ Repositories/Validators $\rightarrow$ Services $\rightarrow$ Controllers/Routes $\rightarrow$ Unit & Integration Tests.
+   - Typecheck (`npm run typecheck`), build (`npm run build`), and test (`npm test`) after each incremental step.
+
 
 ### 1. Implemented Features
 

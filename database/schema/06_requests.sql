@@ -11,6 +11,7 @@ CREATE TABLE requests (
   description                 TEXT NOT NULL,
   student_id                  UUID NOT NULL REFERENCES student_profiles(user_id) ON DELETE RESTRICT,
   category_id                 UUID NOT NULL REFERENCES categories(id) ON DELETE RESTRICT,
+  initial_category_id         UUID NOT NULL REFERENCES categories(id) ON DELETE RESTRICT,
   responsible_department_id   UUID NOT NULL REFERENCES departments(id) ON DELETE RESTRICT,
   current_authority_level_id  UUID NOT NULL,
   current_assignment_id       UUID,

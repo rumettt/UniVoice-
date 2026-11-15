@@ -9,6 +9,7 @@ export interface RequestRecord {
   description: string;
   studentId: string;
   categoryId: string;
+  initialCategoryId?: string;
   categoryName?: string;
   responsibleDepartmentId: string;
   responsibleDepartmentName?: string;
@@ -274,6 +275,7 @@ export class RequestRepository {
         description,
         student_id,
         category_id,
+        initial_category_id,
         responsible_department_id,
         current_authority_level_id,
         current_assignment_id,
@@ -284,7 +286,7 @@ export class RequestRepository {
         status,
         due_at
       ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, NULL, NULL, $4, $4, $8, 'pending', $9
+        $1, $2, $3, $4, $5, $5, $6, $7, NULL, NULL, $4, $4, $8, 'pending', $9
       )
       RETURNING id;
     `;
@@ -469,6 +471,7 @@ export class RequestRepository {
       description: row.description as string,
       studentId: row.studentId as string,
       categoryId: row.categoryId as string,
+      initialCategoryId: (row.initialCategoryId as string) ?? undefined,
       categoryName: (row.categoryName as string) ?? undefined,
       responsibleDepartmentId: row.responsibleDepartmentId as string,
       responsibleDepartmentName: (row.departmentName as string) ?? undefined,
